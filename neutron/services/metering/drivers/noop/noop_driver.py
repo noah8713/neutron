@@ -12,41 +12,32 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo_log import helpers as log_helpers
-
+from neutron.common import log
 from neutron.services.metering.drivers import abstract_driver
 
 
 class NoopMeteringDriver(abstract_driver.MeteringAbstractDriver):
 
-    @log_helpers.log_method_call
+    @log.log
     def update_routers(self, context, routers):
         pass
 
-    @log_helpers.log_method_call
+    @log.log
     def remove_router(self, context, router_id):
         pass
 
-    @log_helpers.log_method_call
+    @log.log
     def update_metering_label_rules(self, context, routers):
         pass
 
-    @log_helpers.log_method_call
-    def add_metering_label_rule(self, context, routers):
-        pass
-
-    @log_helpers.log_method_call
-    def remove_metering_label_rule(self, context, routers):
-        pass
-
-    @log_helpers.log_method_call
+    @log.log
     def add_metering_label(self, context, routers):
         pass
 
-    @log_helpers.log_method_call
+    @log.log
     def remove_metering_label(self, context, routers):
         pass
 
-    @log_helpers.log_method_call
+    @log.log
     def get_traffic_counters(self, context, routers):
         pass

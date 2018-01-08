@@ -19,18 +19,36 @@ IPv6-related utilities and helper functions.
 import os
 
 import netaddr
-from neutron_lib import constants as const
-from oslo_log import log
+
+from neutron.common import constants
+from neutron.openstack.common.gettextutils import _LI
+from neutron.openstack.common import log
 
 
 LOG = log.getLogger(__name__)
 _IS_IPV6_ENABLED = None
 
 
-def is_enabled_and_bind_by_default():
-    """Check if host has the IPv6 support and is configured to bind IPv6
-    address to new interfaces by default.
-    """
+def get_ipv6_addr_by_EUI64(prefix, mac):
+    # Check if the prefix is IPv4 address
+    isIPv4 = netaddr.valid_ipv4(prefix)
+    if isIPv4:
+        msg = _("Unable to generate IP address by EUI64 for IPv4 prefix")
+        raise TypeError(msg)
+    try:
+        eui64 = int(netaddr.EUI(mac).eui64())
+        prefix = netaddr.IPNetwork(prefix)
+        return netaddr.IPAddress(prefix.first + eui64 ^ (1 << 57))
+    except (ValueError, netaddr.AddrFormatError):
+        raise TypeError(_('Bad prefix or mac format for generating IPv6 '
+                          'address by EUI-64: %(prefix)s, %(mac)s:')
+                        % {'prefix': prefix, 'mac': mac})
+    except TypeError:
+        raise TypeError(_('Bad prefix type for generate IPv6 address by '
+                          'EUI-64: %s') % prefix)
+
+
+def is_enabled():
     global _IS_IPV6_ENABLED
 
     if _IS_IPV6_ENABLED is None:
@@ -42,30 +60,12 @@ def is_enabled_and_bind_by_default():
         else:
             _IS_IPV6_ENABLED = False
         if not _IS_IPV6_ENABLED:
-            LOG.info("IPv6 not present or configured not to bind to new "
-                     "interfaces on this system. Please ensure IPv6 is "
-                     "enabled and /proc/sys/net/ipv6/conf/default/"
-                     "disable_ipv6 is set to 0 to enable IPv6.")
+            LOG.info(_LI("IPv6 is not enabled on this system."))
     return _IS_IPV6_ENABLED
 
 
 def is_auto_address_subnet(subnet):
     """Check if subnet is an auto address subnet."""
-    modes = [const.IPV6_SLAAC, const.DHCPV6_STATELESS]
+    modes = [constants.IPV6_SLAAC, constants.DHCPV6_STATELESS]
     return (subnet['ipv6_address_mode'] in modes
             or subnet['ipv6_ra_mode'] in modes)
-
-
-def is_eui64_address(ip_address):
-    """Check if ip address is EUI64."""
-    ip = netaddr.IPAddress(ip_address)
-    # '0xfffe' addition is used to build EUI-64 from MAC (RFC4291)
-    # Look for it in the middle of the EUI-64 part of address
-    return ip.version == 6 and not ((ip & 0xffff000000) ^ 0xfffe000000)
-
-
-def is_ipv6_pd_enabled(subnet):
-    """Returns True if the subnetpool_id of the given subnet is equal to
-       constants.IPV6_PD_POOL_ID
-    """
-    return subnet.get('subnetpool_id') == const.IPV6_PD_POOL_ID

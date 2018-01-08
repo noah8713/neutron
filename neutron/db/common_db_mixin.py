@@ -15,90 +15,181 @@
 
 import weakref
 
-from neutron.db import _model_query
-from neutron.db import _resource_extend
-from neutron.db import _utils as ndb_utils
+from sqlalchemy import sql
+
+from neutron.common import exceptions as n_exc
+from neutron.db import sqlalchemyutils
 
 
-# TODO(HenryG): Remove these when available in neutron-lib
-safe_creation = ndb_utils.safe_creation
-model_query_scope = ndb_utils.model_query_scope_is_project
-model_query = ndb_utils.model_query
-resource_fields = ndb_utils.resource_fields
-
-
-# TODO(HenryG): Deprecate and schedule for removal
 class CommonDbMixin(object):
-    """Deprecated."""
+    """Common methods used in core and service plugins."""
+    # Plugins, mixin classes implementing extension will register
+    # hooks into the dict below for "augmenting" the "core way" of
+    # building a query for retrieving objects from a model class.
+    # To this aim, the register_model_query_hook and unregister_query_hook
+    # from this class should be invoked
+    _model_query_hooks = {}
 
-    @staticmethod
-    def register_model_query_hook(model, name, query_hook, filter_hook,
+    # This dictionary will store methods for extending attributes of
+    # api resources. Mixins can use this dict for adding their own methods
+    # TODO(salvatore-orlando): Avoid using class-level variables
+    _dict_extend_functions = {}
+
+    @classmethod
+    def register_model_query_hook(cls, model, name, query_hook, filter_hook,
                                   result_filters=None):
-        _model_query.register_hook(
-            model, name, query_hook, filter_hook,
-            result_filters=result_filters)
+        """Register a hook to be invoked when a query is executed.
 
-    @staticmethod
-    def register_dict_extend_funcs(resource, funcs):
-        _resource_extend.register_funcs(resource, funcs)
+        Add the hooks to the _model_query_hooks dict. Models are the keys
+        of this dict, whereas the value is another dict mapping hook names to
+        callables performing the hook.
+        Each hook has a "query" component, used to build the query expression
+        and a "filter" component, which is used to build the filter expression.
+
+        Query hooks take as input the query being built and return a
+        transformed query expression.
+
+        Filter hooks take as input the filter expression being built and return
+        a transformed filter expression
+        """
+        model_hooks = cls._model_query_hooks.get(model)
+        if not model_hooks:
+            # add key to dict
+            model_hooks = {}
+            cls._model_query_hooks[model] = model_hooks
+        model_hooks[name] = {'query': query_hook, 'filter': filter_hook,
+                             'result_filters': result_filters}
 
     @property
-    # TODO(HenryG): Remove; used only by vmware-nsx.
     def safe_reference(self):
+        """Return a weakref to the instance.
+
+        Minimize the potential for the instance persisting
+        unnecessarily in memory by returning a weakref proxy that
+        won't prevent deallocation.
+        """
         return weakref.proxy(self)
 
-    @staticmethod
-    def model_query_scope(context, model):
-        return ndb_utils.model_query_scope_is_project(context, model)
+    def _model_query(self, context, model):
+        query = context.session.query(model)
+        # define basic filter condition for model query
+        # NOTE(jkoelker) non-admin queries are scoped to their tenant_id
+        # NOTE(salvatore-orlando): unless the model allows for shared objects
+        query_filter = None
+        if not context.is_admin and hasattr(model, 'tenant_id'):
+            if hasattr(model, 'shared'):
+                query_filter = ((model.tenant_id == context.tenant_id) |
+                                (model.shared == sql.true()))
+            else:
+                query_filter = (model.tenant_id == context.tenant_id)
+        # Execute query hooks registered from mixins and plugins
+        for _name, hooks in self._model_query_hooks.get(model,
+                                                        {}).iteritems():
+            query_hook = hooks.get('query')
+            if isinstance(query_hook, basestring):
+                query_hook = getattr(self, query_hook, None)
+            if query_hook:
+                query = query_hook(context, model, query)
 
-    @staticmethod
-    def _model_query(context, model):
-        return _model_query.query_with_hooks(context, model)
+            filter_hook = hooks.get('filter')
+            if isinstance(filter_hook, basestring):
+                filter_hook = getattr(self, filter_hook, None)
+            if filter_hook:
+                query_filter = filter_hook(context, model, query_filter)
 
-    @staticmethod
-    def _fields(resource, fields):
-        return ndb_utils.resource_fields(resource, fields)
+        # NOTE(salvatore-orlando): 'if query_filter' will try to evaluate the
+        # condition, raising an exception
+        if query_filter is not None:
+            query = query.filter(query_filter)
+        return query
 
-    @staticmethod
-    def _get_by_id(context, model, id):
-        return _model_query.get_by_id(context, model, id)
+    def _fields(self, resource, fields):
+        if fields:
+            return dict(((key, item) for key, item in resource.items()
+                         if key in fields))
+        return resource
 
-    @staticmethod
-    def _apply_filters_to_query(query, model, filters, context=None):
-        return _model_query.apply_filters(query, model, filters, context)
+    def _get_tenant_id_for_create(self, context, resource):
+        if context.is_admin and 'tenant_id' in resource:
+            tenant_id = resource['tenant_id']
+        elif ('tenant_id' in resource and
+              resource['tenant_id'] != context.tenant_id):
+            reason = _('Cannot create resource for another tenant')
+            raise n_exc.AdminRequired(reason=reason)
+        else:
+            tenant_id = context.tenant_id
+        return tenant_id
 
-    @staticmethod
-    def _apply_dict_extend_functions(resource_type, response, db_object):
-        _resource_extend.apply_funcs(resource_type, response, db_object)
+    def _get_by_id(self, context, model, id):
+        query = self._model_query(context, model)
+        return query.filter(model.id == id).one()
 
-    @staticmethod
-    def _get_collection_query(context, model,
-                              filters=None, sorts=None,
-                              limit=None, marker_obj=None,
+    def _apply_filters_to_query(self, query, model, filters):
+        if filters:
+            for key, value in filters.iteritems():
+                column = getattr(model, key, None)
+                if column:
+                    query = query.filter(column.in_(value))
+            for _name, hooks in self._model_query_hooks.get(model,
+                                                            {}).iteritems():
+                result_filter = hooks.get('result_filters', None)
+                if isinstance(result_filter, basestring):
+                    result_filter = getattr(self, result_filter, None)
+
+                if result_filter:
+                    query = result_filter(query, filters)
+        return query
+
+    def _apply_dict_extend_functions(self, resource_type,
+                                     response, db_object):
+        for func in self._dict_extend_functions.get(
+            resource_type, []):
+            args = (response, db_object)
+            if isinstance(func, basestring):
+                func = getattr(self, func, None)
+            else:
+                # must call unbound method - use self as 1st argument
+                args = (self,) + args
+            if func:
+                func(*args)
+
+    def _get_collection_query(self, context, model, filters=None,
+                              sorts=None, limit=None, marker_obj=None,
                               page_reverse=False):
-        return _model_query.get_collection_query(context, model,
-                                                 filters, sorts,
-                                                 limit, marker_obj,
-                                                 page_reverse)
+        collection = self._model_query(context, model)
+        collection = self._apply_filters_to_query(collection, model, filters)
+        if limit and page_reverse and sorts:
+            sorts = [(s[0], not s[1]) for s in sorts]
+        collection = sqlalchemyutils.paginate_query(collection, model, limit,
+                                                    sorts,
+                                                    marker_obj=marker_obj)
+        return collection
 
-    @staticmethod
-    def _get_collection(context, model, dict_func,
-                        filters=None, fields=None, sorts=None,
-                        limit=None, marker_obj=None,
+    def _get_collection(self, context, model, dict_func, filters=None,
+                        fields=None, sorts=None, limit=None, marker_obj=None,
                         page_reverse=False):
-        return _model_query.get_collection(context, model, dict_func,
-                                           filters, fields, sorts,
-                                           limit, marker_obj,
-                                           page_reverse)
+        query = self._get_collection_query(context, model, filters=filters,
+                                           sorts=sorts,
+                                           limit=limit,
+                                           marker_obj=marker_obj,
+                                           page_reverse=page_reverse)
+        items = [dict_func(c, fields) for c in query]
+        if limit and page_reverse:
+            items.reverse()
+        return items
 
-    @staticmethod
-    def _get_collection_count(context, model, filters=None):
-        return _model_query.get_collection_count(context, model, filters)
+    def _get_collection_count(self, context, model, filters=None):
+        return self._get_collection_query(context, model, filters).count()
 
-    # TODO(HenryG): Remove this when available in neutron-lib
     def _get_marker_obj(self, context, resource, limit, marker):
-        return ndb_utils.get_marker_obj(self, context, resource, limit, marker)
+        if limit and marker:
+            return getattr(self, '_get_%s' % resource)(context, marker)
+        return None
 
-    @staticmethod
-    def _filter_non_model_columns(data, model):
-        return ndb_utils.filter_non_model_columns(data, model)
+    def _filter_non_model_columns(self, data, model):
+        """Remove all the attributes from data which are not columns of
+        the model passed as second parameter.
+        """
+        columns = [c.name for c in model.__table__.columns]
+        return dict((k, v) for (k, v) in
+                    data.iteritems() if k in columns)

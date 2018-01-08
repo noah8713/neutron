@@ -15,21 +15,18 @@
 
 import abc
 
-from neutron_lib.api import extensions as api_extensions
-from neutron_lib.api import faults
-from neutron_lib import constants
-from neutron_lib import exceptions
-from neutron_lib.exceptions import agent as agent_exc
-from neutron_lib.plugins import constants as plugin_constants
-from neutron_lib.plugins import directory
-from oslo_log import log as logging
-import six
 import webob.exc
 
-from neutron._i18n import _
 from neutron.api import extensions
+from neutron.api.v2 import base
 from neutron.api.v2 import resource
+from neutron.common import constants
+from neutron.common import exceptions
 from neutron.common import rpc as n_rpc
+from neutron.extensions import agent
+from neutron import manager
+from neutron.openstack.common import log as logging
+from neutron.plugins.common import constants as service_constants
 from neutron import policy
 from neutron import wsgi
 
@@ -45,10 +42,11 @@ L3_AGENTS = L3_AGENT + 's'
 
 class RouterSchedulerController(wsgi.Controller):
     def get_plugin(self):
-        plugin = directory.get_plugin(plugin_constants.L3)
+        plugin = manager.NeutronManager.get_service_plugins().get(
+            service_constants.L3_ROUTER_NAT)
         if not plugin:
-            LOG.error('No plugin for L3 routing registered to handle '
-                      'router scheduling')
+            LOG.error(_('No plugin for L3 routing registered to handle '
+                        'router scheduling'))
             msg = _('The resource could not be found.')
             raise webob.exc.HTTPNotFound(msg)
         return plugin
@@ -87,16 +85,18 @@ class RouterSchedulerController(wsgi.Controller):
 
 class L3AgentsHostingRouterController(wsgi.Controller):
     def get_plugin(self):
-        plugin = directory.get_plugin(plugin_constants.L3)
+        plugin = manager.NeutronManager.get_service_plugins().get(
+            service_constants.L3_ROUTER_NAT)
         if not plugin:
-            LOG.error('No plugin for L3 routing registered to handle '
-                      'router scheduling')
+            LOG.error(_('No plugin for L3 routing registered to handle '
+                        'router scheduling'))
             msg = _('The resource could not be found.')
             raise webob.exc.HTTPNotFound(msg)
         return plugin
 
     def index(self, request, **kwargs):
-        plugin = self.get_plugin()
+        plugin = manager.NeutronManager.get_service_plugins().get(
+            service_constants.L3_ROUTER_NAT)
         policy.enforce(request.context,
                        "get_%s" % L3_AGENTS,
                        {})
@@ -104,7 +104,7 @@ class L3AgentsHostingRouterController(wsgi.Controller):
             request.context, kwargs['router_id'])
 
 
-class L3agentscheduler(api_extensions.ExtensionDescriptor):
+class L3agentscheduler(extensions.ExtensionDescriptor):
     """Extension class supporting l3 agent scheduler.
     """
 
@@ -121,6 +121,10 @@ class L3agentscheduler(api_extensions.ExtensionDescriptor):
         return "Schedule routers among l3 agents"
 
     @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/ext/l3_agent_scheduler/api/v1.0"
+
+    @classmethod
     def get_updated(cls):
         return "2013-02-07T10:00:00-00:00"
 
@@ -132,7 +136,7 @@ class L3agentscheduler(api_extensions.ExtensionDescriptor):
                       collection_name="agents")
 
         controller = resource.Resource(RouterSchedulerController(),
-                                       faults.FAULT_MAP)
+                                       base.FAULT_MAP)
         exts.append(extensions.ResourceExtension(
             L3_ROUTERS, controller, parent))
 
@@ -140,7 +144,7 @@ class L3agentscheduler(api_extensions.ExtensionDescriptor):
                       collection_name="routers")
 
         controller = resource.Resource(L3AgentsHostingRouterController(),
-                                       faults.FAULT_MAP)
+                                       base.FAULT_MAP)
         exts.append(extensions.ResourceExtension(
             L3_AGENTS, controller, parent))
         return exts
@@ -149,18 +153,18 @@ class L3agentscheduler(api_extensions.ExtensionDescriptor):
         return {}
 
 
-class InvalidL3Agent(agent_exc.AgentNotFound):
+class InvalidL3Agent(agent.AgentNotFound):
     message = _("Agent %(id)s is not a L3 Agent or has been disabled")
 
 
 class RouterHostedByL3Agent(exceptions.Conflict):
-    message = _("The router %(router_id)s has been already hosted "
-                "by the L3 Agent %(agent_id)s.")
+    message = _("The router %(router_id)s has been already hosted"
+                " by the L3 Agent %(agent_id)s.")
 
 
 class RouterSchedulingFailed(exceptions.Conflict):
-    message = _("Failed scheduling router %(router_id)s to "
-                "the L3 Agent %(agent_id)s.")
+    message = _("Failed scheduling router %(router_id)s to"
+                " the L3 Agent %(agent_id)s.")
 
 
 class RouterReschedulingFailed(exceptions.Conflict):
@@ -168,26 +172,16 @@ class RouterReschedulingFailed(exceptions.Conflict):
                 "no eligible l3 agent found.")
 
 
+class RouterNotHostedByL3Agent(exceptions.Conflict):
+    message = _("The router %(router_id)s is not hosted"
+                " by L3 agent %(agent_id)s.")
+
+
 class RouterL3AgentMismatch(exceptions.Conflict):
-    message = _("Cannot host distributed router %(router_id)s "
-                "on legacy L3 agent %(agent_id)s.")
+    message = _("Cannot host %(router_type)s router %(router_id)s "
+                "on %(agent_mode)s L3 agent %(agent_id)s.")
 
 
-class DVRL3CannotAssignToDvrAgent(exceptions.Conflict):
-    message = _("Not allowed to manually assign a router to an "
-                "agent in 'dvr' mode.")
-
-
-class DVRL3CannotRemoveFromDvrAgent(exceptions.Conflict):
-    message = _("Not allowed to manually remove a router from "
-                "an agent in 'dvr' mode.")
-
-
-class RouterDoesntSupportScheduling(exceptions.Conflict):
-    message = _("Router %(router_id)s does not support agent scheduling.")
-
-
-@six.add_metaclass(abc.ABCMeta)
 class L3AgentSchedulerPluginBase(object):
     """REST API to operate the l3 agent scheduler.
 
@@ -209,10 +203,6 @@ class L3AgentSchedulerPluginBase(object):
     @abc.abstractmethod
     def list_l3_agents_hosting_router(self, context, router_id):
         pass
-
-    def router_supports_scheduling(self, context, router_id):
-        """Override this method to conditionally schedule routers."""
-        return True
 
 
 def notify(context, action, router_id, agent_id):

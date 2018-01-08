@@ -14,35 +14,26 @@
 #    under the License.
 
 import os
+import time
 
-from oslo_config import cfg
-
-from neutron.agent.linux import utils
-from neutron.conf.agent import common as config
 from neutron.tests import base
-from neutron.tests.common import base as common_base
-from neutron.tests.common import helpers
-
-# This is the directory from which infra fetches log files for functional tests
-DEFAULT_LOG_DIR = os.path.join(helpers.get_test_log_path(),
-                               'dsvm-functional-logs')
 
 
-class BaseLoggingTestCase(base.BaseTestCase):
-    def setUp(self):
-        super(BaseLoggingTestCase, self).setUp()
-        base.setup_test_logging(
-            cfg.CONF, DEFAULT_LOG_DIR, "%s.txt" % self.id())
+SUDO_CMD = 'sudo -n'
+TIMEOUT = 60
+SLEEP_INTERVAL = 1
 
 
-class BaseSudoTestCase(BaseLoggingTestCase):
+class BaseSudoTestCase(base.BaseTestCase):
     """
     Base class for tests requiring invocation of commands via a root helper.
 
-    This class skips (during setUp) its tests unless sudo is enabled, ie:
-    OS_SUDO_TESTING is set to '1' or 'True' in the test execution environment.
-    This is intended to allow developers to run the functional suite (e.g. tox
-    -e functional) without test failures if sudo invocations are not allowed.
+    Inheritors of this class should call check_sudo_enabled() in
+    setUp() to ensure that tests requiring sudo are skipped unless
+    OS_SUDO_TESTING is set to '1' or 'True' in the test execution
+    environment.  This is intended to allow developers to run the
+    functional suite (e.g. tox -e functional) without test failures if
+    sudo invocations are not allowed.
 
     Running sudo tests in the upstream gate jobs
     (*-neutron-dsvm-functional) requires the additional step of
@@ -58,16 +49,17 @@ class BaseSudoTestCase(BaseLoggingTestCase):
 
     def setUp(self):
         super(BaseSudoTestCase, self).setUp()
-        if not base.bool_from_env('OS_SUDO_TESTING'):
-            self.skipTest('Testing with sudo is not enabled')
-        self.setup_rootwrap()
-        config.setup_privsep()
+        env = os.environ
+        self.sudo_enabled = env.get('OS_SUDO_TESTING') in base.TRUE_STRING
+        self.root_helper = env.get('OS_ROOTWRAP_CMD', SUDO_CMD)
+        self.fail_on_missing_deps = (
+            env.get('OS_FAIL_ON_MISSING_DEPS') in base.TRUE_STRING)
 
-    @common_base.no_skip_on_missing_deps
-    def check_command(self, cmd, error_text, skip_msg, run_as_root=False):
-        try:
-            utils.execute(cmd, run_as_root=run_as_root)
-        except RuntimeError as e:
-            if error_text in str(e):
-                self.skipTest(skip_msg)
-            raise
+    def check_sudo_enabled(self):
+        if not self.sudo_enabled:
+            self.skipTest('testing with sudo is not enabled')
+
+    def wait_until(self, predicate, *args, **kwargs):
+        with self.assert_max_execution_time(TIMEOUT):
+            while not predicate(*args, **kwargs):
+                time.sleep(SLEEP_INTERVAL)

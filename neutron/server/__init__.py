@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 # Copyright 2011 VMware, Inc.
 # All Rights Reserved.
 #
@@ -18,35 +20,51 @@
 
 import sys
 
+import eventlet
+eventlet.monkey_patch()
+
 from oslo_config import cfg
 
-from neutron._i18n import _
 from neutron.common import config
-from neutron.common import profiler
+from neutron import service
+
+from neutron.openstack.common import gettextutils
+from neutron.openstack.common import log as logging
+gettextutils.install('neutron', lazy=True)
+
+LOG = logging.getLogger(__name__)
 
 
-def _init_configuration():
+def main():
     # the configuration will be read into the cfg.CONF global data structure
     config.init(sys.argv[1:])
-    config.setup_logging()
-    config.set_config_defaults()
     if not cfg.CONF.config_file:
         sys.exit(_("ERROR: Unable to find configuration file via the default"
                    " search paths (~/.neutron/, ~/, /etc/neutron/, /etc/) and"
                    " the '--config-file' option!"))
-
-
-def boot_server(server_func):
-    _init_configuration()
     try:
-        server_func()
+        pool = eventlet.GreenPool()
+
+        neutron_api = service.serve_wsgi(service.NeutronApiService)
+        api_thread = pool.spawn(neutron_api.wait)
+
+        try:
+            neutron_rpc = service.serve_rpc()
+        except NotImplementedError:
+            LOG.info(_("RPC was already started in parent process by plugin."))
+        else:
+            rpc_thread = pool.spawn(neutron_rpc.wait)
+
+            # api and rpc should die together.  When one dies, kill the other.
+            rpc_thread.link(lambda gt: api_thread.kill())
+            api_thread.link(lambda gt: rpc_thread.kill())
+
+        pool.waitall()
     except KeyboardInterrupt:
         pass
     except RuntimeError as e:
         sys.exit(_("ERROR: %s") % e)
 
 
-def get_application():
-    _init_configuration()
-    profiler.setup('neutron-server', cfg.CONF.host)
-    return config.load_paste_app('neutron')
+if __name__ == "__main__":
+    main()

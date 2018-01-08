@@ -1,4 +1,4 @@
-# Copyright (c) 2015 Red Hat, Inc.
+# Copyright (c) 2014 Red Hat, Inc.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,90 +13,80 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.agent.linux import ip_lib
 from neutron.agent.linux import ipset_manager
 from neutron.agent.linux import iptables_manager
-from neutron.common import utils
-from neutron.tests.common import machine_fixtures
-from neutron.tests.common import net_helpers
 from neutron.tests.functional.agent.linux import base
-from neutron.tests.functional import base as functional_base
 
-MAX_IPSET_NAME_LENGTH = 28
+IPSET_CHAIN = 'test-chain'
 IPSET_ETHERTYPE = 'IPv4'
+ICMP_ACCEPT_RULE = '-p icmp -m set --match-set %s src -j ACCEPT' % IPSET_CHAIN
 UNRELATED_IP = '1.1.1.1'
 
 
-class IpsetBase(functional_base.BaseSudoTestCase):
+class IpsetBase(base.BaseIPVethTestCase):
 
     def setUp(self):
         super(IpsetBase, self).setUp()
 
-        bridge = self.useFixture(net_helpers.VethBridgeFixture()).bridge
-        self.source, self.destination = self.useFixture(
-            machine_fixtures.PeerMachines(bridge)).machines
+        self.src_ns, self.dst_ns = self.prepare_veth_pairs()
+        self.ipset = self._create_ipset_manager_and_chain(self.dst_ns,
+                                                          IPSET_CHAIN)
 
-        self.ipset_name = utils.get_rand_name(MAX_IPSET_NAME_LENGTH, 'set-')
-        self.icmp_accept_rule = ('-p icmp -m set --match-set %s src -j ACCEPT'
-                                 % self.ipset_name)
-        self.ipset = self._create_ipset_manager_and_set(
-            ip_lib.IPWrapper(self.destination.namespace), self.ipset_name)
-        self.addCleanup(self.ipset._destroy, self.ipset_name)
         self.dst_iptables = iptables_manager.IptablesManager(
-            namespace=self.destination.namespace)
+            root_helper=self.root_helper,
+            namespace=self.dst_ns.namespace)
 
-        self._add_iptables_ipset_rules()
-        self.addCleanup(self._remove_iptables_ipset_rules)
+        self._add_iptables_ipset_rules(self.dst_iptables)
 
-    def _create_ipset_manager_and_set(self, dst_ns, set_name):
+    def _create_ipset_manager_and_chain(self, dst_ns, chain_name):
         ipset = ipset_manager.IpsetManager(
+            root_helper=self.root_helper,
             namespace=dst_ns.namespace)
 
-        ipset._create_set(set_name, IPSET_ETHERTYPE)
+        ipset.create_ipset_chain(chain_name, IPSET_ETHERTYPE)
         return ipset
 
-    def _remove_iptables_ipset_rules(self):
-        self.dst_iptables.ipv4['filter'].remove_rule(
-            'INPUT', base.ICMP_BLOCK_RULE)
-        self.dst_iptables.ipv4['filter'].remove_rule(
-            'INPUT', self.icmp_accept_rule)
-        self.dst_iptables.apply()
+    @staticmethod
+    def _remove_iptables_ipset_rules(iptables_manager):
+        iptables_manager.ipv4['filter'].remove_rule('INPUT', ICMP_ACCEPT_RULE)
+        iptables_manager.apply()
 
-    def _add_iptables_ipset_rules(self):
-        self.dst_iptables.ipv4['filter'].add_rule(
-            'INPUT', self.icmp_accept_rule)
-        self.dst_iptables.ipv4['filter'].add_rule(
-            'INPUT', base.ICMP_BLOCK_RULE)
-        self.dst_iptables.apply()
+    @staticmethod
+    def _add_iptables_ipset_rules(iptables_manager):
+        iptables_manager.ipv4['filter'].add_rule('INPUT', ICMP_ACCEPT_RULE)
+        iptables_manager.ipv4['filter'].add_rule('INPUT', base.ICMP_BLOCK_RULE)
+        iptables_manager.apply()
 
 
 class IpsetManagerTestCase(IpsetBase):
 
     def test_add_member_allows_ping(self):
-        self.source.assert_no_ping(self.destination.ip)
-        self.ipset._add_member_to_set(self.ipset_name, self.source.ip)
-        self.source.assert_ping(self.destination.ip)
+        self.pinger.assert_no_ping_from_ns(self.src_ns, self.DST_ADDRESS)
+        self.ipset.add_member_to_ipset_chain(IPSET_CHAIN, self.SRC_ADDRESS)
+        self.pinger.assert_ping_from_ns(self.src_ns, self.DST_ADDRESS)
 
     def test_del_member_denies_ping(self):
-        self.ipset._add_member_to_set(self.ipset_name, self.source.ip)
-        self.source.assert_ping(self.destination.ip)
+        self.ipset.add_member_to_ipset_chain(IPSET_CHAIN, self.SRC_ADDRESS)
+        self.pinger.assert_ping_from_ns(self.src_ns, self.DST_ADDRESS)
 
-        self.ipset._del_member_from_set(self.ipset_name, self.source.ip)
-        self.source.assert_no_ping(self.destination.ip)
+        self.ipset.del_ipset_chain_member(IPSET_CHAIN, self.SRC_ADDRESS)
+        self.pinger.assert_no_ping_from_ns(self.src_ns, self.DST_ADDRESS)
 
     def test_refresh_ipset_allows_ping(self):
-        self.ipset._refresh_set(
-            self.ipset_name, [UNRELATED_IP], IPSET_ETHERTYPE)
-        self.source.assert_no_ping(self.destination.ip)
+        self.ipset.refresh_ipset_chain_by_name(IPSET_CHAIN, [UNRELATED_IP],
+                                               IPSET_ETHERTYPE)
+        self.pinger.assert_no_ping_from_ns(self.src_ns, self.DST_ADDRESS)
 
-        self.ipset._refresh_set(
-            self.ipset_name, [UNRELATED_IP, self.source.ip], IPSET_ETHERTYPE)
-        self.source.assert_ping(self.destination.ip)
+        self.ipset.refresh_ipset_chain_by_name(
+            IPSET_CHAIN, [UNRELATED_IP, self.SRC_ADDRESS], IPSET_ETHERTYPE)
+        self.pinger.assert_ping_from_ns(self.src_ns, self.DST_ADDRESS)
 
-        self.ipset._refresh_set(
-            self.ipset_name, [self.source.ip, UNRELATED_IP], IPSET_ETHERTYPE)
-        self.source.assert_ping(self.destination.ip)
+        self.ipset.refresh_ipset_chain_by_name(
+            IPSET_CHAIN, [self.SRC_ADDRESS, UNRELATED_IP], IPSET_ETHERTYPE)
+        self.pinger.assert_ping_from_ns(self.src_ns, self.DST_ADDRESS)
 
-    def test_destroy_ipset_set(self):
-        self._remove_iptables_ipset_rules()
-        self.ipset._destroy(self.ipset_name)
+    def test_destroy_ipset_chain(self):
+        self.assertRaises(RuntimeError,
+                          self.ipset.destroy_ipset_chain_by_name, IPSET_CHAIN)
+        self._remove_iptables_ipset_rules(self.dst_iptables)
+        self.ipset.destroy_ipset_chain_by_name(IPSET_CHAIN)

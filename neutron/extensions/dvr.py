@@ -14,28 +14,79 @@
 
 import abc
 
-from neutron_lib.api.definitions import dvr as apidef
-from neutron_lib.api import extensions
-from neutron_lib import exceptions
 import six
 
-from neutron._i18n import _
+from neutron.api.v2 import attributes
+from neutron.common import constants
+from neutron.common import exceptions
+
+DISTRIBUTED = 'distributed'
+EXTENDED_ATTRIBUTES_2_0 = {
+    'routers': {
+        DISTRIBUTED: {'allow_post': True,
+                      'allow_put': True,
+                      'is_visible': True,
+                      'default': attributes.ATTR_NOT_SPECIFIED,
+                      'convert_to': attributes.convert_to_boolean_if_not_none,
+                      'enforce_policy': True},
+    }
+}
 
 
-# TODO(boden): consume with I88e1aa2acf22389f69cb7d5704c80a5eb72a9bbe
 class DVRMacAddressNotFound(exceptions.NotFound):
     message = _("Distributed Virtual Router Mac Address for "
                 "host %(host)s does not exist.")
 
 
-class Dvr(extensions.APIExtensionDescriptor):
+class MacAddressGenerationFailure(exceptions.ServiceUnavailable):
+    message = _("Unable to generate unique DVR mac for host %(host)s.")
+
+
+class Dvr(object):
     """Extension class supporting distributed virtual router."""
 
-    api_definition = apidef
+    @classmethod
+    def get_name(cls):
+        return "Distributed Virtual Router"
+
+    @classmethod
+    def get_alias(cls):
+        return constants.L3_DISTRIBUTED_EXT_ALIAS
+
+    @classmethod
+    def get_description(cls):
+        return "Enables configuration of Distributed Virtual Routers."
+
+    @classmethod
+    def get_namespace(cls):
+        return ("http://docs.openstack.org/ext/"
+                "%s/api/v1.0" % constants.L3_DISTRIBUTED_EXT_ALIAS)
+
+    @classmethod
+    def get_updated(cls):
+        return "2014-06-1T10:00:00-00:00"
+
+    def get_required_extensions(self):
+        return ["router"]
+
+    @classmethod
+    def get_resources(cls):
+        """Returns Ext Resources."""
+        return []
+
+    def get_extended_resources(self, version):
+        if version == "2.0":
+            return EXTENDED_ATTRIBUTES_2_0
+        else:
+            return {}
 
 
 @six.add_metaclass(abc.ABCMeta)
 class DVRMacAddressPluginBase(object):
+
+    @abc.abstractmethod
+    def delete_dvr_mac_address(self, context, host):
+        pass
 
     @abc.abstractmethod
     def get_dvr_mac_address_list(self, context):

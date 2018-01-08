@@ -12,45 +12,44 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_log import log as logging
-from oslo_serialization import jsonutils
+import eventlet
 
 from neutron.agent.linux import async_process
-from neutron.agent.ovsdb import api as ovsdb
-from neutron.agent.ovsdb.native import helpers
-from neutron.common import utils
+from neutron.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
-
-OVSDB_ACTION_INITIAL = 'initial'
-OVSDB_ACTION_INSERT = 'insert'
-OVSDB_ACTION_DELETE = 'delete'
-OVSDB_ACTION_NEW = 'new'
 
 
 class OvsdbMonitor(async_process.AsyncProcess):
     """Manages an invocation of 'ovsdb-client monitor'."""
 
     def __init__(self, table_name, columns=None, format=None,
-                 respawn_interval=None, ovsdb_connection=None):
-        if ovsdb_connection:
-            # if ovsdb connection is configured (e.g. tcp:ip:port), use it,
-            # and there is no need to run as root
-            helpers.enable_connection_uri(ovsdb_connection)
-            cmd = ['ovsdb-client', 'monitor', ovsdb_connection, table_name]
-            run_as_root = False
-        else:
-            cmd = ['ovsdb-client', 'monitor', table_name]
-            run_as_root = True
+                 root_helper=None, respawn_interval=None):
+
+        cmd = ['ovsdb-client', 'monitor', table_name]
         if columns:
             cmd.append(','.join(columns))
         if format:
             cmd.append('--format=%s' % format)
-        super(OvsdbMonitor, self).__init__(cmd, run_as_root=run_as_root,
-                                           respawn_interval=respawn_interval,
-                                           log_output=True,
-                                           die_on_error=True)
+        super(OvsdbMonitor, self).__init__(cmd,
+                                           root_helper=root_helper,
+                                           respawn_interval=respawn_interval)
+
+    def _read_stdout(self):
+        data = self._process.stdout.readline()
+        if not data:
+            return
+        self._stdout_lines.put(data)
+        LOG.debug(_('Output received from ovsdb monitor: %s') % data)
+        return data
+
+    def _read_stderr(self):
+        data = super(OvsdbMonitor, self)._read_stderr()
+        if data:
+            LOG.error(_('Error received from ovsdb monitor: %s') % data)
+            # Do not return value to ensure that stderr output will
+            # stop the monitor.
 
 
 class SimpleInterfaceMonitor(OvsdbMonitor):
@@ -61,64 +60,46 @@ class SimpleInterfaceMonitor(OvsdbMonitor):
     since the previous access.
     """
 
-    def __init__(self, respawn_interval=None, ovsdb_connection=None):
+    def __init__(self, root_helper=None, respawn_interval=None):
         super(SimpleInterfaceMonitor, self).__init__(
             'Interface',
-            columns=['name', 'ofport', 'external_ids'],
+            columns=['name', 'ofport'],
             format='json',
+            root_helper=root_helper,
             respawn_interval=respawn_interval,
-            ovsdb_connection=ovsdb_connection
         )
-        self.new_events = {'added': [], 'removed': []}
+        self.data_received = False
+
+    @property
+    def is_active(self):
+        return (self.data_received and
+                self._kill_event and
+                not self._kill_event.ready())
 
     @property
     def has_updates(self):
         """Indicate whether the ovsdb Interface table has been updated.
 
-        If the monitor process is not active an error will be logged since
-        it won't be able to communicate any update. This situation should be
-        temporary if respawn_interval is set.
+        True will be returned if the monitor process is not active.
+        This 'failing open' minimizes the risk of falsely indicating
+        the absence of updates at the expense of potential false
+        positives.
         """
-        if not self.is_active():
-            LOG.error("Interface monitor is not active")
-        else:
-            self.process_events()
-        return bool(self.new_events['added'] or self.new_events['removed'])
-
-    def get_events(self):
-        self.process_events()
-        events = self.new_events
-        self.new_events = {'added': [], 'removed': []}
-        return events
-
-    def process_events(self):
-        devices_added = []
-        devices_removed = []
-        dev_to_ofport = {}
-        for row in self.iter_stdout():
-            json = jsonutils.loads(row).get('data')
-            for ovs_id, action, name, ofport, external_ids in json:
-                if external_ids:
-                    external_ids = ovsdb.val_to_py(external_ids)
-                if ofport:
-                    ofport = ovsdb.val_to_py(ofport)
-                device = {'name': name,
-                          'ofport': ofport,
-                          'external_ids': external_ids}
-                if action in (OVSDB_ACTION_INITIAL, OVSDB_ACTION_INSERT):
-                    devices_added.append(device)
-                elif action == OVSDB_ACTION_DELETE:
-                    devices_removed.append(device)
-                elif action == OVSDB_ACTION_NEW:
-                    dev_to_ofport[name] = ofport
-
-        self.new_events['added'].extend(devices_added)
-        self.new_events['removed'].extend(devices_removed)
-        # update any events with ofports received from 'new' action
-        for event in self.new_events['added']:
-            event['ofport'] = dev_to_ofport.get(event['name'], event['ofport'])
+        return bool(list(self.iter_stdout())) or not self.is_active
 
     def start(self, block=False, timeout=5):
         super(SimpleInterfaceMonitor, self).start()
         if block:
-            utils.wait_until_true(self.is_active)
+            with eventlet.timeout.Timeout(timeout):
+                while not self.is_active:
+                    eventlet.sleep()
+
+    def _kill(self, *args, **kwargs):
+        self.data_received = False
+        super(SimpleInterfaceMonitor, self)._kill(*args, **kwargs)
+
+    def _read_stdout(self):
+        data = super(SimpleInterfaceMonitor, self)._read_stdout()
+        if data and not self.data_received:
+            self.data_received = True
+        return data

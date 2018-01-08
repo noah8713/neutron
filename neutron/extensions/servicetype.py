@@ -13,13 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api import extensions as api_extensions
-
-from neutron._i18n import _
 from neutron.api import extensions
+from neutron.api.v2 import attributes
 from neutron.api.v2 import base
 from neutron.db import servicetype_db
+from neutron.openstack.common import log as logging
 
+LOG = logging.getLogger(__name__)
 
 RESOURCE_NAME = "service_provider"
 COLLECTION_NAME = "%ss" % RESOURCE_NAME
@@ -42,7 +42,7 @@ RESOURCE_ATTRIBUTE_MAP = {
 }
 
 
-class Servicetype(api_extensions.ExtensionDescriptor):
+class Servicetype(extensions.ExtensionDescriptor):
 
     @classmethod
     def get_name(cls):
@@ -58,12 +58,18 @@ class Servicetype(api_extensions.ExtensionDescriptor):
                  "Neutron advanced services")
 
     @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/ext/neutron/service-type/api/v1.0"
+
+    @classmethod
     def get_updated(cls):
         return "2013-01-20T00:00:00-00:00"
 
     @classmethod
     def get_resources(cls):
         """Returns Extended Resource for service type management."""
+        my_plurals = [(key, key[:-1]) for key in RESOURCE_ATTRIBUTE_MAP.keys()]
+        attributes.PLURALS.update(dict(my_plurals))
         attr_map = RESOURCE_ATTRIBUTE_MAP[COLLECTION_NAME]
         collection_name = COLLECTION_NAME.replace('_', '-')
         controller = base.create_resource(

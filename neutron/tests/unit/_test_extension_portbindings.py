@@ -13,18 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api.definitions import portbindings
-from neutron_lib import context
-from neutron_lib.plugins import directory
+import contextlib
+import httplib
+
 from oslo_config import cfg
-from six.moves import http_client as httplib
 from webob import exc
 
-from neutron.tests.unit.db import test_db_base_plugin_v2
-from neutron.tests.unit import dummy_plugin
+from neutron import context
+from neutron.extensions import portbindings
+from neutron import manager
+from neutron.tests.unit import test_db_plugin
 
 
-class PortBindingsTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
+class PortBindingsTestCase(test_db_plugin.NeutronDbPluginV2TestCase):
 
     # VIF_TYPE must be overridden according to plugin vif_type
     VIF_TYPE = portbindings.VIF_TYPE_OTHER
@@ -58,7 +59,8 @@ class PortBindingsTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
     def _get_non_admin_context(self):
         return context.Context(user_id=None,
                                tenant_id=self._tenant_id,
-                               is_admin=False)
+                               is_admin=False,
+                               read_deleted="no")
 
     def test_port_vif_details(self):
         with self.port(name='name') as port:
@@ -76,9 +78,9 @@ class PortBindingsTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
             self._check_response_no_portbindings(non_admin_port)
 
     def test_ports_vif_details(self):
-        plugin = directory.get_plugin()
+        plugin = manager.NeutronManager.get_plugin()
         cfg.CONF.set_default('allow_overlapping_ips', True)
-        with self.port(), self.port():
+        with contextlib.nested(self.port(), self.port()):
             ctx = context.get_admin_context()
             ports = plugin.get_ports(ctx)
             self.assertEqual(len(ports), 2)
@@ -130,8 +132,7 @@ class PortBindingsTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
         self._test_update_port_binding_profile({})
 
     def test_port_create_portinfo_non_admin(self):
-        profile_arg = {portbindings.PROFILE: {dummy_plugin.RESOURCE_NAME:
-                                              dummy_plugin.RESOURCE_NAME}}
+        profile_arg = {portbindings.PROFILE: {'dummy': 'dummy'}}
         with self.network(set_context=True, tenant_id='test') as net1:
             with self.subnet(network=net1) as subnet1:
                 # succeed without binding:profile
@@ -150,8 +151,7 @@ class PortBindingsTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
                     pass
 
     def test_port_update_portinfo_non_admin(self):
-        profile_arg = {portbindings.PROFILE: {dummy_plugin.RESOURCE_NAME:
-                                              dummy_plugin.RESOURCE_NAME}}
+        profile_arg = {portbindings.PROFILE: {'dummy': 'dummy'}}
         with self.network() as net1:
             with self.subnet(network=net1) as subnet1:
                 with self.port(subnet=subnet1) as port:
@@ -205,7 +205,8 @@ class PortBindingsHostTestCaseMixin(object):
             # By default user is admin - now test non admin user
             ctx = context.Context(user_id=None,
                                   tenant_id=self._tenant_id,
-                                  is_admin=False)
+                                  is_admin=False,
+                                  read_deleted="no")
             non_admin_port = self._show(
                 'ports', port_id, neutron_context=ctx)['port']
             self._check_response_no_portbindings_host(non_admin_port)
@@ -213,9 +214,11 @@ class PortBindingsHostTestCaseMixin(object):
     def test_ports_vif_host(self):
         cfg.CONF.set_default('allow_overlapping_ips', True)
         host_arg = {portbindings.HOST_ID: self.hostname}
-        with self.port(name='name1',
-                       arg_list=(portbindings.HOST_ID,),
-                       **host_arg), self.port(name='name2'):
+        with contextlib.nested(
+            self.port(name='name1',
+                      arg_list=(portbindings.HOST_ID,),
+                      **host_arg),
+            self.port(name='name2')):
             ctx = context.get_admin_context()
             ports = self._list('ports', neutron_context=ctx)['ports']
             self.assertEqual(2, len(ports))
@@ -227,7 +230,8 @@ class PortBindingsHostTestCaseMixin(object):
             # By default user is admin - now test non admin user
             ctx = context.Context(user_id=None,
                                   tenant_id=self._tenant_id,
-                                  is_admin=False)
+                                  is_admin=False,
+                                  read_deleted="no")
             ports = self._list('ports', neutron_context=ctx)['ports']
             self.assertEqual(2, len(ports))
             for non_admin_port in ports:
@@ -236,8 +240,11 @@ class PortBindingsHostTestCaseMixin(object):
     def test_ports_vif_host_update(self):
         cfg.CONF.set_default('allow_overlapping_ips', True)
         host_arg = {portbindings.HOST_ID: self.hostname}
-        with self.port(name='name1', arg_list=(portbindings.HOST_ID,),
-                       **host_arg) as port1, self.port(name='name2') as port2:
+        with contextlib.nested(
+            self.port(name='name1',
+                      arg_list=(portbindings.HOST_ID,),
+                      **host_arg),
+            self.port(name='name2')) as (port1, port2):
             data = {'port': {portbindings.HOST_ID: 'testhosttemp'}}
             req = self.new_update_request('ports', data, port1['port']['id'])
             req.get_response(self.api)
@@ -270,13 +277,14 @@ class PortBindingsHostTestCaseMixin(object):
     def test_ports_vif_host_list(self):
         cfg.CONF.set_default('allow_overlapping_ips', True)
         host_arg = {portbindings.HOST_ID: self.hostname}
-        with self.port(name='name1',
-                       arg_list=(portbindings.HOST_ID,),
-                       **host_arg) as port1,\
-                self.port(name='name2'),\
-                self.port(name='name3',
-                          arg_list=(portbindings.HOST_ID,),
-                          **host_arg) as port3:
+        with contextlib.nested(
+            self.port(name='name1',
+                      arg_list=(portbindings.HOST_ID,),
+                      **host_arg),
+            self.port(name='name2'),
+            self.port(name='name3',
+                      arg_list=(portbindings.HOST_ID,),
+                      **host_arg),) as (port1, _port2, port3):
             self._test_list_resources(
                 'port', (port1, port3),
                 query_params='%s=%s' % (portbindings.HOST_ID, self.hostname))
@@ -318,7 +326,8 @@ class PortBindingsVnicTestCaseMixin(object):
             # By default user is admin - now test non admin user
             ctx = context.Context(user_id=None,
                                   tenant_id=self._tenant_id,
-                                  is_admin=False)
+                                  is_admin=False,
+                                  read_deleted="no")
             non_admin_port = self._show(
                 'ports', port_id, neutron_context=ctx)['port']
             self._check_response_portbindings_vnic_type(non_admin_port)
@@ -326,8 +335,11 @@ class PortBindingsVnicTestCaseMixin(object):
     def test_ports_vnic_type(self):
         cfg.CONF.set_default('allow_overlapping_ips', True)
         vnic_arg = {portbindings.VNIC_TYPE: self.vnic_type}
-        with self.port(name='name1', arg_list=(portbindings.VNIC_TYPE,),
-                       **vnic_arg), self.port(name='name2'):
+        with contextlib.nested(
+            self.port(name='name1',
+                      arg_list=(portbindings.VNIC_TYPE,),
+                      **vnic_arg),
+            self.port(name='name2')):
             ctx = context.get_admin_context()
             ports = self._list('ports', neutron_context=ctx)['ports']
             self.assertEqual(2, len(ports))
@@ -340,7 +352,8 @@ class PortBindingsVnicTestCaseMixin(object):
             # By default user is admin - now test non admin user
             ctx = context.Context(user_id=None,
                                   tenant_id=self._tenant_id,
-                                  is_admin=False)
+                                  is_admin=False,
+                                  read_deleted="no")
             ports = self._list('ports', neutron_context=ctx)['ports']
             self.assertEqual(2, len(ports))
             for non_admin_port in ports:
@@ -349,13 +362,14 @@ class PortBindingsVnicTestCaseMixin(object):
     def test_ports_vnic_type_list(self):
         cfg.CONF.set_default('allow_overlapping_ips', True)
         vnic_arg = {portbindings.VNIC_TYPE: self.vnic_type}
-        with self.port(name='name1',
-                       arg_list=(portbindings.VNIC_TYPE,),
-                       **vnic_arg) as port1,\
-                self.port(name='name2') as port2,\
-                self.port(name='name3',
-                          arg_list=(portbindings.VNIC_TYPE,),
-                          **vnic_arg) as port3:
+        with contextlib.nested(
+            self.port(name='name1',
+                      arg_list=(portbindings.VNIC_TYPE,),
+                      **vnic_arg),
+            self.port(name='name2'),
+            self.port(name='name3',
+                      arg_list=(portbindings.VNIC_TYPE,),
+                      **vnic_arg),) as (port1, port2, port3):
             self._test_list_resources(
                 'port', (port1, port2, port3),
                 query_params='%s=%s' % (portbindings.VNIC_TYPE,

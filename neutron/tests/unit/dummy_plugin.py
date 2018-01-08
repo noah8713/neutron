@@ -13,21 +13,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib import exceptions
-from neutron_lib.plugins import directory
-from neutron_lib.services import base as service_base
-from oslo_utils import uuidutils
-
 from neutron.api import extensions
 from neutron.api.v2 import base
+from neutron.common import exceptions
 from neutron.db import servicetype_db
 from neutron.extensions import servicetype
-from neutron import neutron_plugin_base_v2
+from neutron import manager
+from neutron.openstack.common import uuidutils
+from neutron.plugins.common import constants
+from neutron.services import service_base
 
 
+DUMMY_PLUGIN_NAME = "dummy_plugin"
 RESOURCE_NAME = "dummy"
 COLLECTION_NAME = "%ss" % RESOURCE_NAME
-DUMMY_SERVICE_TYPE = "DUMMY"
 
 # Attribute Map for dummy resource
 RESOURCE_ATTRIBUTE_MAP = {
@@ -54,15 +53,19 @@ class Dummy(object):
 
     @classmethod
     def get_name(cls):
-        return RESOURCE_NAME
+        return "dummy"
 
     @classmethod
     def get_alias(cls):
-        return RESOURCE_NAME
+        return "dummy"
 
     @classmethod
     def get_description(cls):
         return "Dummy stuff"
+
+    @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/ext/neutron/dummy/api/v1.0"
 
     @classmethod
     def get_updated(cls):
@@ -71,7 +74,8 @@ class Dummy(object):
     @classmethod
     def get_resources(cls):
         """Returns Extended Resource for dummy management."""
-        dummy_inst = directory.get_plugin(DUMMY_SERVICE_TYPE)
+        q_mgr = manager.NeutronManager.get_instance()
+        dummy_inst = q_mgr.get_service_plugins()['DUMMY']
         controller = base.create_resource(
             COLLECTION_NAME, RESOURCE_NAME, dummy_inst,
             RESOURCE_ATTRIBUTE_MAP[COLLECTION_NAME])
@@ -80,24 +84,25 @@ class Dummy(object):
 
 
 class DummyServicePlugin(service_base.ServicePluginBase):
-    """This is a simple plugin for managing instances of a fictional 'dummy'
+    """This is a simple plugin for managing instantes of a fictional 'dummy'
         service. This plugin is provided as a proof-of-concept of how
         advanced service might leverage the service type extension.
         Ideally, instances of real advanced services, such as load balancing
         or VPN will adopt a similar solution.
     """
 
-    supported_extension_aliases = [RESOURCE_NAME, servicetype.EXT_ALIAS]
-    path_prefix = "/dummy_svc"
-    agent_notifiers = {RESOURCE_NAME: 'dummy_agent_notifier'}
+    supported_extension_aliases = ['dummy', servicetype.EXT_ALIAS]
+    agent_notifiers = {'dummy': 'dummy_agent_notifier'}
 
     def __init__(self):
         self.svctype_mgr = servicetype_db.ServiceTypeManager.get_instance()
         self.dummys = {}
 
-    @classmethod
-    def get_plugin_type(cls):
-        return DUMMY_SERVICE_TYPE
+    def get_plugin_type(self):
+        return constants.DUMMY
+
+    def get_plugin_name(self):
+        return DUMMY_PLUGIN_NAME
 
     def get_plugin_description(self):
         return "Neutron Dummy Service Plugin"
@@ -112,7 +117,7 @@ class DummyServicePlugin(service_base.ServicePluginBase):
             raise exceptions.NotFound()
 
     def create_dummy(self, context, dummy):
-        d = dummy[RESOURCE_NAME]
+        d = dummy['dummy']
         d['id'] = uuidutils.generate_uuid()
         self.dummys[d['id']] = d
         self.svctype_mgr.increase_service_type_refcount(context,
@@ -130,54 +135,3 @@ class DummyServicePlugin(service_base.ServicePluginBase):
                                                             svc_type_id)
         except KeyError:
             raise exceptions.NotFound()
-
-
-class DummyCorePluginWithoutDatastore(
-        neutron_plugin_base_v2.NeutronPluginBaseV2):
-    def create_subnet(self, context, subnet):
-        pass
-
-    def update_subnet(self, context, id, subnet):
-        pass
-
-    def get_subnet(self, context, id, fields=None):
-        pass
-
-    def get_subnets(self, context, filters=None, fields=None,
-                    sorts=None, limit=None, marker=None, page_reverse=False):
-        pass
-
-    def delete_subnet(self, context, id):
-        pass
-
-    def create_network(self, context, network):
-        pass
-
-    def update_network(self, context, id, network):
-        pass
-
-    def get_network(self, context, id, fields=None):
-        pass
-
-    def get_networks(self, context, filters=None, fields=None,
-                     sorts=None, limit=None, marker=None, page_reverse=False):
-        pass
-
-    def delete_network(self, context, id):
-        pass
-
-    def create_port(self, context, port):
-        pass
-
-    def update_port(self, context, id, port):
-        pass
-
-    def get_port(self, context, id, fields=None):
-        pass
-
-    def get_ports(self, context, filters=None, fields=None,
-                  sorts=None, limit=None, marker=None, page_reverse=False):
-        pass
-
-    def delete_port(self, context, id):
-        pass

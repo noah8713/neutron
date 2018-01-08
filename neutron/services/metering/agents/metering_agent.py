@@ -13,61 +13,71 @@
 # under the License.
 
 import sys
+import time
 
-from neutron_lib import constants
-from neutron_lib import context
-from neutron_lib.utils import runtime
+import eventlet
+eventlet.monkey_patch()
+
 from oslo_config import cfg
-from oslo_log import log as logging
-import oslo_messaging
-from oslo_service import loopingcall
-from oslo_service import periodic_task
-from oslo_service import service
-from oslo_utils import timeutils
 
-from neutron._i18n import _
+from neutron.agent.common import config
 from neutron.agent import rpc as agent_rpc
 from neutron.common import config as common_config
-from neutron.common import constants as n_const
+from neutron.common import constants as constants
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
-from neutron.conf.agent import common as config
-from neutron.conf.services import metering_agent
+from neutron.common import utils
+from neutron import context
 from neutron import manager
+from neutron.openstack.common import importutils
+from neutron.openstack.common import log as logging
+from neutron.openstack.common import loopingcall
+from neutron.openstack.common import periodic_task
+from neutron.openstack.common import service
 from neutron import service as neutron_service
-from neutron.services.metering.drivers import utils as driverutils
 
 
 LOG = logging.getLogger(__name__)
 
 
-class MeteringPluginRpc(object):
+class MeteringPluginRpc(n_rpc.RpcProxy):
+
+    BASE_RPC_API_VERSION = '1.0'
 
     def __init__(self, host):
-        # NOTE(yamamoto): super.__init__() call here is not only for
-        # aesthetics.  Because of multiple inheritances in MeteringAgent,
-        # it's actually necessary to initialize parent classes of
-        # manager.Manager correctly.
-        super(MeteringPluginRpc, self).__init__(host)
-        target = oslo_messaging.Target(topic=topics.METERING_PLUGIN,
-                                       version='1.0')
-        self.client = n_rpc.get_client(target)
+        super(MeteringPluginRpc,
+              self).__init__(topic=topics.METERING_AGENT,
+                             default_version=self.BASE_RPC_API_VERSION)
 
     def _get_sync_data_metering(self, context):
         try:
-            cctxt = self.client.prepare()
-            return cctxt.call(context, 'get_sync_data_metering',
-                              host=self.host)
+            return self.call(context,
+                             self.make_msg('get_sync_data_metering',
+                                           host=self.host),
+                             topic=topics.METERING_PLUGIN)
         except Exception:
-            LOG.exception("Failed synchronizing routers")
+            LOG.exception(_("Failed synchronizing routers"))
 
 
 class MeteringAgent(MeteringPluginRpc, manager.Manager):
 
+    Opts = [
+        cfg.StrOpt('driver',
+                   default='neutron.services.metering.drivers.noop.'
+                   'noop_driver.NoopMeteringDriver',
+                   help=_("Metering driver")),
+        cfg.IntOpt('measure_interval', default=30,
+                   help=_("Interval between two metering measures")),
+        cfg.IntOpt('report_interval', default=300,
+                   help=_("Interval between two metering reports")),
+    ]
+
     def __init__(self, host, conf=None):
         self.conf = conf or cfg.CONF
         self._load_drivers()
+        self.root_helper = config.get_root_helper(self.conf)
         self.context = context.get_admin_context_without_session()
+        self.metering_info = {}
         self.metering_loop = loopingcall.FixedIntervalLoopingCall(
             self._metering_loop
         )
@@ -83,11 +93,11 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
 
     def _load_drivers(self):
         """Loads plugin-driver from configuration."""
-        LOG.info("Loading Metering driver %s", self.conf.driver)
+        LOG.info(_("Loading Metering driver %s"), self.conf.driver)
         if not self.conf.driver:
             raise SystemExit(_('A metering driver must be specified'))
-        self.metering_driver = driverutils.load_metering_driver(self,
-                                                                self.conf)
+        self.metering_driver = importutils.import_object(
+            self.conf.driver, self, self.conf)
 
     def _metering_notification(self):
         for label_id, info in self.metering_infos.items():
@@ -100,7 +110,7 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
                     'last_update': info['last_update'],
                     'host': self.host}
 
-            LOG.debug("Send metering report: %s", data)
+            LOG.debug(_("Send metering report: %s"), data)
             notifier = n_rpc.get_notifier('metering')
             notifier.info(self.context, 'l3.meter', data)
             info['pkts'] = 0
@@ -108,16 +118,14 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
             info['time'] = 0
 
     def _purge_metering_info(self):
-        deadline_timestamp = timeutils.utcnow_ts() - self.conf.report_interval
-        label_ids = [
-            label_id
-            for label_id, info in self.metering_infos.items()
-            if info['last_update'] < deadline_timestamp]
-        for label_id in label_ids:
-            del self.metering_infos[label_id]
+        ts = int(time.time())
+        report_interval = self.conf.report_interval
+        for label_id, info in self.metering_info.items():
+            if info['last_update'] > ts + report_interval:
+                del self.metering_info[label_id]
 
     def _add_metering_info(self, label_id, pkts, bytes):
-        ts = timeutils.utcnow_ts()
+        ts = int(time.time())
         info = self.metering_infos.get(label_id, {'bytes': 0,
                                                   'pkts': 0,
                                                   'time': 0,
@@ -136,11 +144,12 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
         self.label_tenant_id = {}
         for router in self.routers.values():
             tenant_id = router['tenant_id']
-            labels = router.get(n_const.METERING_LABEL_KEY, [])
+            labels = router.get(constants.METERING_LABEL_KEY, [])
             for label in labels:
                 label_id = label['id']
                 self.label_tenant_id[label_id] = tenant_id
 
+            tenant_id = self.label_tenant_id.get
         accs = self._get_traffic_counters(self.context, self.routers.values())
         if not accs:
             return
@@ -151,39 +160,31 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
     def _metering_loop(self):
         self._add_metering_infos()
 
-        ts = timeutils.utcnow_ts()
+        ts = int(time.time())
         delta = ts - self.last_report
 
         report_interval = self.conf.report_interval
-        if delta >= report_interval:
+        if delta > report_interval:
             self._metering_notification()
             self._purge_metering_info()
             self.last_report = ts
 
-    @runtime.synchronized('metering-agent')
+    @utils.synchronized('metering-agent')
     def _invoke_driver(self, context, meterings, func_name):
         try:
             return getattr(self.metering_driver, func_name)(context, meterings)
         except AttributeError:
-            LOG.exception("Driver %(driver)s does not implement %(func)s",
+            LOG.exception(_("Driver %(driver)s does not implement %(func)s"),
                           {'driver': self.conf.driver,
                            'func': func_name})
         except RuntimeError:
-            LOG.exception("Driver %(driver)s:%(func)s runtime error",
+            LOG.exception(_("Driver %(driver)s:%(func)s runtime error"),
                           {'driver': self.conf.driver,
                            'func': func_name})
 
     @periodic_task.periodic_task(run_immediately=True)
     def _sync_routers_task(self, context):
         routers = self._get_sync_data_metering(self.context)
-
-        routers_on_agent = set(self.routers.keys())
-        routers_on_server = set(
-            [router['id'] for router in routers] if routers else [])
-        for router_id in routers_on_agent - routers_on_server:
-            del self.routers[router_id]
-            self._invoke_driver(context, router_id, 'remove_router')
-
         if not routers:
             return
         self._update_routers(context, routers)
@@ -212,31 +213,23 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
                                    'update_routers')
 
     def _get_traffic_counters(self, context, routers):
-        LOG.debug("Get router traffic counters")
+        LOG.debug(_("Get router traffic counters"))
         return self._invoke_driver(context, routers, 'get_traffic_counters')
 
-    def add_metering_label_rule(self, context, routers):
-        return self._invoke_driver(context, routers,
-                                   'add_metering_label_rule')
-
-    def remove_metering_label_rule(self, context, routers):
-        return self._invoke_driver(context, routers,
-                                   'remove_metering_label_rule')
-
     def update_metering_label_rules(self, context, routers):
-        LOG.debug("Update metering rules from agent")
+        LOG.debug(_("Update metering rules from agent"))
         return self._invoke_driver(context, routers,
                                    'update_metering_label_rules')
 
     def add_metering_label(self, context, routers):
-        LOG.debug("Creating a metering label from agent")
+        LOG.debug(_("Creating a metering label from agent"))
         return self._invoke_driver(context, routers,
                                    'add_metering_label')
 
     def remove_metering_label(self, context, routers):
         self._add_metering_infos()
 
-        LOG.debug("Delete a metering label from agent")
+        LOG.debug(_("Delete a metering label from agent"))
         return self._invoke_driver(context, routers,
                                    'remove_metering_label')
 
@@ -246,7 +239,7 @@ class MeteringAgentWithStateReport(MeteringAgent):
     def __init__(self, host, conf=None):
         super(MeteringAgentWithStateReport, self).__init__(host=host,
                                                            conf=conf)
-        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.REPORTS)
+        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
         self.agent_state = {
             'binary': 'neutron-metering-agent',
             'host': host,
@@ -274,20 +267,22 @@ class MeteringAgentWithStateReport(MeteringAgent):
             self.use_call = False
         except AttributeError:
             # This means the server does not support report_state
-            LOG.warning("Neutron server does not support state report. "
-                        "State report for this agent will be disabled.")
+            LOG.warn(_("Neutron server does not support state report."
+                       " State report for this agent will be disabled."))
             self.heartbeat.stop()
+            return
         except Exception:
-            LOG.exception("Failed reporting state!")
+            LOG.exception(_("Failed reporting state!"))
 
     def agent_updated(self, context, payload):
-        LOG.info("agent_updated by server side %s!", payload)
+        LOG.info(_("agent_updated by server side %s!"), payload)
 
 
 def main():
     conf = cfg.CONF
-    metering_agent.register_metering_agent_opts()
+    conf.register_opts(MeteringAgent.Opts)
     config.register_agent_state_opts_helper(conf)
+    config.register_root_helper(conf)
     common_config.init(sys.argv[1:])
     config.setup_logging()
     server = neutron_service.Service.create(
@@ -296,4 +291,4 @@ def main():
         report_interval=cfg.CONF.AGENT.report_interval,
         manager='neutron.services.metering.agents.'
                 'metering_agent.MeteringAgentWithStateReport')
-    service.launch(cfg.CONF, server).wait()
+    service.launch(server).wait()

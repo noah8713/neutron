@@ -12,29 +12,134 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api.definitions import network as net_def
-from neutron_lib.api.definitions import port as port_def
-from neutron_lib.api.definitions import port_security as psec
-from neutron_lib.api import validators
-from neutron_lib.plugins import directory
-from neutron_lib.utils import net
+import sqlalchemy as sa
+from sqlalchemy import orm
+from sqlalchemy.orm import exc
 
-from neutron.db import _resource_extend as resource_extend
-from neutron.db import portsecurity_db_common
+from neutron.api.v2 import attributes as attrs
+from neutron.db import db_base_plugin_v2
+from neutron.db import model_base
+from neutron.db import models_v2
+from neutron.extensions import portsecurity as psec
+from neutron.openstack.common import log as logging
+
+LOG = logging.getLogger(__name__)
 
 
-@resource_extend.has_resource_extenders
-class PortSecurityDbMixin(portsecurity_db_common.PortSecurityDbCommon):
+class PortSecurityBinding(model_base.BASEV2):
+    port_id = sa.Column(sa.String(36),
+                        sa.ForeignKey('ports.id', ondelete="CASCADE"),
+                        primary_key=True)
+    port_security_enabled = sa.Column(sa.Boolean(), nullable=False)
 
-    @staticmethod
-    @resource_extend.extends([net_def.COLLECTION_NAME,
-                              port_def.COLLECTION_NAME])
-    def _extend_port_security_dict(response_data, db_data):
-        plugin = directory.get_plugin()
+    # Add a relationship to the Port model in order to be to able to
+    # instruct SQLAlchemy to eagerly load port security binding
+    port = orm.relationship(
+        models_v2.Port,
+        backref=orm.backref("port_security", uselist=False,
+                            cascade='delete', lazy='joined'))
+
+
+class NetworkSecurityBinding(model_base.BASEV2):
+    network_id = sa.Column(sa.String(36),
+                           sa.ForeignKey('networks.id', ondelete="CASCADE"),
+                           primary_key=True)
+    port_security_enabled = sa.Column(sa.Boolean(), nullable=False)
+
+    # Add a relationship to the Port model in order to be able to instruct
+    # SQLAlchemy to eagerly load default port security setting for ports
+    # on this network
+    network = orm.relationship(
+        models_v2.Network,
+        backref=orm.backref("port_security", uselist=False,
+                            cascade='delete', lazy='joined'))
+
+
+class PortSecurityDbMixin(object):
+    """Mixin class to add port security."""
+
+    def _process_network_port_security_create(
+        self, context, network_req, network_res):
+        with context.session.begin(subtransactions=True):
+            db = NetworkSecurityBinding(
+                network_id=network_res['id'],
+                port_security_enabled=network_req[psec.PORTSECURITY])
+            context.session.add(db)
+        network_res[psec.PORTSECURITY] = network_req[psec.PORTSECURITY]
+        return self._make_network_port_security_dict(db)
+
+    def _process_port_port_security_create(
+        self, context, port_req, port_res):
+        with context.session.begin(subtransactions=True):
+            db = PortSecurityBinding(
+                port_id=port_res['id'],
+                port_security_enabled=port_req[psec.PORTSECURITY])
+            context.session.add(db)
+        port_res[psec.PORTSECURITY] = port_req[psec.PORTSECURITY]
+        return self._make_port_security_dict(db)
+
+    def _extend_port_security_dict(self, response_data, db_data):
         if ('port-security' in
-                getattr(plugin, 'supported_extension_aliases', [])):
-            super(PortSecurityDbMixin, plugin)._extend_port_security_dict(
-                response_data, db_data)
+            getattr(self, 'supported_extension_aliases', [])):
+            psec_value = db_data['port_security'][psec.PORTSECURITY]
+            response_data[psec.PORTSECURITY] = psec_value
+
+    def _get_network_security_binding(self, context, network_id):
+        try:
+            query = self._model_query(context, NetworkSecurityBinding)
+            binding = query.filter(
+                NetworkSecurityBinding.network_id == network_id).one()
+        except exc.NoResultFound:
+            raise psec.PortSecurityBindingNotFound()
+        return binding[psec.PORTSECURITY]
+
+    def _get_port_security_binding(self, context, port_id):
+        try:
+            query = self._model_query(context, PortSecurityBinding)
+            binding = query.filter(
+                PortSecurityBinding.port_id == port_id).one()
+        except exc.NoResultFound:
+            raise psec.PortSecurityBindingNotFound()
+        return binding[psec.PORTSECURITY]
+
+    def _process_port_port_security_update(
+        self, context, port_req, port_res):
+        if psec.PORTSECURITY in port_req:
+            port_security_enabled = port_req[psec.PORTSECURITY]
+        else:
+            return
+        try:
+            query = self._model_query(context, PortSecurityBinding)
+            port_id = port_res['id']
+            binding = query.filter(
+                PortSecurityBinding.port_id == port_id).one()
+
+            binding.port_security_enabled = port_security_enabled
+            port_res[psec.PORTSECURITY] = port_security_enabled
+        except exc.NoResultFound:
+            raise psec.PortSecurityBindingNotFound()
+
+    def _process_network_port_security_update(
+        self, context, network_req, network_res):
+        if psec.PORTSECURITY in network_req:
+            port_security_enabled = network_req[psec.PORTSECURITY]
+        else:
+            return
+        try:
+            query = self._model_query(context, NetworkSecurityBinding)
+            network_id = network_res['id']
+            binding = query.filter(
+                NetworkSecurityBinding.network_id == network_id).one()
+
+            binding.port_security_enabled = port_security_enabled
+            network_res[psec.PORTSECURITY] = port_security_enabled
+        except exc.NoResultFound:
+            raise psec.PortSecurityBindingNotFound()
+
+    def _make_network_port_security_dict(self, port_security, fields=None):
+        res = {'network_id': port_security['network_id'],
+               psec.PORTSECURITY: port_security[psec.PORTSECURITY]}
+        return self._fields(res, fields)
 
     def _determine_port_security_and_has_ip(self, context, port):
         """Returns a tuple of booleans (port_security_enabled, has_ip).
@@ -45,17 +150,19 @@ class PortSecurityDbMixin(portsecurity_db_common.PortSecurityDbCommon):
         """
         has_ip = self._ip_on_port(port)
         # we don't apply security groups for dhcp, router
-        if port.get('device_owner') and net.is_port_trusted(port):
+        if (port.get('device_owner') and
+                port['device_owner'].startswith('network:')):
             return (False, has_ip)
 
-        if validators.is_attr_set(port.get(psec.PORTSECURITY)):
+        if (psec.PORTSECURITY in port and
+            isinstance(port[psec.PORTSECURITY], bool)):
             port_security_enabled = port[psec.PORTSECURITY]
 
         # If port has an ip and security_groups are passed in
         # conveniently set port_security_enabled to true this way
         # user doesn't also have to pass in port_security_enabled=True
         # when creating ports.
-        elif has_ip and validators.is_attr_set(port.get('security_groups')):
+        elif (has_ip and attrs.is_attr_set('security_groups')):
             port_security_enabled = True
         else:
             port_security_enabled = self._get_network_security_binding(
@@ -63,5 +170,16 @@ class PortSecurityDbMixin(portsecurity_db_common.PortSecurityDbCommon):
 
         return (port_security_enabled, has_ip)
 
+    def _make_port_security_dict(self, port, fields=None):
+        res = {'port_id': port['port_id'],
+               psec.PORTSECURITY: port[psec.PORTSECURITY]}
+        return self._fields(res, fields)
+
     def _ip_on_port(self, port):
         return bool(port.get('fixed_ips'))
+
+    # Register dict extend functions for ports and networks
+    db_base_plugin_v2.NeutronDbPluginV2.register_dict_extend_funcs(
+        attrs.NETWORKS, ['_extend_port_security_dict'])
+    db_base_plugin_v2.NeutronDbPluginV2.register_dict_extend_funcs(
+        attrs.PORTS, ['_extend_port_security_dict'])

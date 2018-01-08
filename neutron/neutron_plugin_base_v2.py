@@ -21,13 +21,11 @@ methods that needs to be implemented by a v2 Neutron Plug-in.
 """
 
 import abc
-
-from neutron_lib.services import base as base_services
 import six
 
 
 @six.add_metaclass(abc.ABCMeta)
-class NeutronPluginBaseV2(base_services.WorkerBase):
+class NeutronPluginBaseV2(object):
 
     @abc.abstractmethod
     def create_subnet(self, context, subnet):
@@ -85,7 +83,7 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
         :param filters: a dictionary with keys that are valid keys for
                         a subnet as listed in the :obj:`RESOURCE_ATTRIBUTE_MAP`
                         object in :file:`neutron/api/v2/attributes.py`.
-                        Values in this dictionary are an iterable containing
+                        Values in this dictiontary are an iterable containing
                         values that will be used for an exact match comparison
                         for that value.  Each result returned by this
                         function will have matched one of the values for each
@@ -110,7 +108,7 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.  Values in this
-                        dictionary are an iterable containing values that
+                        dictiontary are an iterable containing values that
                         will be used for an exact match comparison for that
                         value.  Each result returned by this function will
                         have matched one of the values for each key in filters.
@@ -128,45 +126,6 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
         :param id: UUID representing the subnet to delete.
         """
         pass
-
-    def create_subnetpool(self, context, subnetpool):
-        """Create a subnet pool.
-
-        :param context: neutron api request context
-        :param subnetpool: Dictionary representing the subnetpool to create.
-        """
-        raise NotImplementedError()
-
-    def update_subnetpool(self, context, id, subnetpool):
-        """Update a subnet pool.
-
-        :param context: neutron api request context
-        :param subnetpool: Dictionary representing the subnetpool attributes
-                           to update.
-        """
-        raise NotImplementedError()
-
-    def get_subnetpool(self, context, id, fields=None):
-        """Show a subnet pool.
-
-        :param context: neutron api request context
-        :param id: The UUID of the subnetpool to show.
-        """
-        raise NotImplementedError()
-
-    def get_subnetpools(self, context, filters=None, fields=None,
-                        sorts=None, limit=None, marker=None,
-                        page_reverse=False):
-        """Retrieve list of subnet pools."""
-        raise NotImplementedError()
-
-    def delete_subnetpool(self, context, id):
-        """Delete a subnet pool.
-
-        :param context: neutron api request context
-        :param id: The UUID of the subnet pool to delete.
-        """
-        raise NotImplementedError()
 
     @abc.abstractmethod
     def create_network(self, context, network):
@@ -226,7 +185,7 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.  Values in this
-                        dictionary are an iterable containing values that will
+                        dictiontary are an iterable containing values that will
                         be used for an exact match comparison for that value.
                         Each result returned by this function will have matched
                         one of the values for each key in filters.
@@ -250,7 +209,7 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object
                         in :file:`neutron/api/v2/attributes.py`. Values in
-                        this dictionary are an iterable containing values that
+                        this dictiontary are an iterable containing values that
                         will be used for an exact match comparison for that
                         value.  Each result returned by this function will have
                         matched one of the values for each key in filters.
@@ -323,7 +282,7 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
         :param filters: a dictionary with keys that are valid keys for
                         a port as listed in the  :obj:`RESOURCE_ATTRIBUTE_MAP`
                         object in :file:`neutron/api/v2/attributes.py`. Values
-                        in this dictionary are an iterable containing values
+                        in this dictiontary are an iterable containing values
                         that will be used for an exact match comparison for
                         that value.  Each result returned by this function will
                         have matched one of the values for each key in filters.
@@ -346,7 +305,7 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.  Values in this
-                        dictionary are an iterable containing values that will
+                        dictiontary are an iterable containing values that will
                         be used for an exact match comparison for that value.
                         Each result returned by this function will have matched
                         one of the values for each key in filters.
@@ -377,16 +336,6 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
         """
         raise NotImplementedError()
 
-    def start_rpc_state_reports_listener(self):
-        """Start the RPC listeners consuming state reports queue.
-
-        This optional method creates rpc consumer for REPORTS queue only.
-
-        .. note:: this method is optional, as it was not part of the originally
-                  defined plugin API.
-        """
-        raise NotImplementedError()
-
     def rpc_workers_supported(self):
         """Return whether the plugin supports multiple RPC workers.
 
@@ -401,19 +350,3 @@ class NeutronPluginBaseV2(base_services.WorkerBase):
         """
         return (self.__class__.start_rpc_listeners !=
                 NeutronPluginBaseV2.start_rpc_listeners)
-
-    def rpc_state_report_workers_supported(self):
-        """Return whether the plugin supports state report RPC workers.
-
-        .. note:: this method is optional, as it was not part of the originally
-                  defined plugin API.
-        """
-        return (self.__class__.start_rpc_state_reports_listener !=
-                NeutronPluginBaseV2.start_rpc_state_reports_listener)
-
-    def has_native_datastore(self):
-        """Return True if the plugin uses Neutron's native datastore.
-
-        .. note:: plugins like ML2 should override this method and return True.
-        """
-        return False

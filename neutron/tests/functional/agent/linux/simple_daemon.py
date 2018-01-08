@@ -12,8 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import time
-
+import eventlet
 from oslo_config import cfg
 
 from neutron.agent.linux import daemon
@@ -30,16 +29,17 @@ def main():
 
         def run(self):
             while True:
-                time.sleep(10)
+                eventlet.sleep(10)
 
+    eventlet.monkey_patch()
     opts = [
         cfg.StrOpt('uuid',
-                   help='uuid provided from the command line '
-                        'so external_process can track us via /proc/'
-                        'cmdline interface.',
+                   help=_('uuid provided from the command line '
+                          'so external_process can track us via /proc/'
+                          'cmdline interface.'),
                    required=True),
         cfg.StrOpt('pid_file',
-                   help='Location of pid file of this process.',
+                   help=_('Location of pid file of this process.'),
                    required=True)
     ]
 

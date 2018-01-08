@@ -13,37 +13,41 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import netaddr
+from oslo_db import exception as db_exc
 
-from neutron_lib.api.definitions import portbindings
-from neutron_lib.callbacks import events
-from neutron_lib.callbacks import registry
-from neutron_lib.callbacks import resources
-from neutron_lib import constants
-from neutron_lib import exceptions as n_exc
-from neutron_lib.objects import exceptions
-from neutron_lib.plugins import directory
-from neutron_lib.utils import net
-from oslo_config import cfg
-from oslo_log import helpers as log_helpers
-from oslo_log import log as logging
-from sqlalchemy import or_
+import sqlalchemy as sa
 
+from neutron.common import exceptions as q_exc
+from neutron.common import log
 from neutron.common import utils
-from neutron.conf.db import dvr_mac_db
-from neutron.db import api as db_api
-from neutron.db import models_v2
+from neutron.db import model_base
 from neutron.extensions import dvr as ext_dvr
-from neutron.objects import router
-
+from neutron.extensions import portbindings
+from neutron import manager
+from neutron.openstack.common import log as logging
+from oslo_config import cfg
+from sqlalchemy.orm import exc
 
 LOG = logging.getLogger(__name__)
 
+dvr_mac_address_opts = [
+    cfg.StrOpt('dvr_base_mac',
+               default="fa:16:3f:00:00:00",
+               help=_('The base mac address used for unique '
+                      'DVR instances by Neutron')),
+]
+cfg.CONF.register_opts(dvr_mac_address_opts)
 
-dvr_mac_db.register_db_dvr_mac_opts()
+
+class DistributedVirtualRouterMacAddress(model_base.BASEV2):
+    """Represents a v2 neutron distributed virtual router mac address."""
+
+    __tablename__ = 'dvr_host_macs'
+
+    host = sa.Column(sa.String(255), primary_key=True, nullable=False)
+    mac_address = sa.Column(sa.String(32), nullable=False, unique=True)
 
 
-@registry.has_registry_receivers
 class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
     """Mixin class to add dvr mac address to db_plugin_base_v2."""
 
@@ -54,70 +58,54 @@ class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
                 return self._plugin
         except AttributeError:
             pass
-        self._plugin = directory.get_plugin()
+        self._plugin = manager.NeutronManager.get_plugin()
         return self._plugin
 
-    @staticmethod
-    @registry.receives(resources.AGENT, [events.BEFORE_DELETE])
-    @db_api.retry_if_session_inactive()
-    def _delete_mac_associated_with_agent(resource, event, trigger, context,
-                                          agent, **kwargs):
-        host = agent['host']
-        plugin = directory.get_plugin()
-        if [a for a in plugin.get_agents(context, filters={'host': [host]})
-                if a['id'] != agent['id']]:
-            # there are still agents on this host, don't mess with the mac
-            # entry until they are all deleted.
-            return
-
-        if not router.DVRMacAddress.delete_objects(context, host=host):
-            return
-
-        # notify remaining agents so they cleanup flows
-        dvr_macs = plugin.get_dvr_mac_address_list(context)
-        plugin.notifier.dvr_mac_address_update(context, dvr_macs)
-
-    @db_api.context_manager.reader
     def _get_dvr_mac_address_by_host(self, context, host):
-        dvr_obj = router.DVRMacAddress.get_object(context, host=host)
-        if not dvr_obj:
+        try:
+            query = context.session.query(DistributedVirtualRouterMacAddress)
+            dvrma = query.filter(
+                DistributedVirtualRouterMacAddress.host == host).one()
+        except exc.NoResultFound:
             raise ext_dvr.DVRMacAddressNotFound(host=host)
-        return self._make_dvr_mac_address_dict(dvr_obj)
-
-    @utils.transaction_guard
-    @db_api.retry_if_session_inactive()
-    def _create_dvr_mac_address_retry(self, context, host, base_mac):
-        with db_api.context_manager.writer.using(context):
-            mac_address = net.get_random_mac(base_mac)
-            dvr_mac_binding = router.DVRMacAddress(
-                context, host=host, mac_address=netaddr.EUI(mac_address))
-            dvr_mac_binding.create()
-            LOG.debug("Generated DVR mac for host %(host)s "
-                      "is %(mac_address)s",
-                      {'host': host, 'mac_address': mac_address})
-
-        dvr_macs = self.get_dvr_mac_address_list(context)
-        # TODO(vivek): improve scalability of this fanout by
-        # sending a single mac address rather than the entire set
-        self.notifier.dvr_mac_address_update(context, dvr_macs)
-        return self._make_dvr_mac_address_dict(dvr_mac_binding)
+        return dvrma
 
     def _create_dvr_mac_address(self, context, host):
         """Create DVR mac address for a given host."""
         base_mac = cfg.CONF.dvr_base_mac.split(':')
-        try:
-            return self._create_dvr_mac_address_retry(context, host, base_mac)
-        except exceptions.NeutronDbObjectDuplicateEntry:
-            LOG.error("MAC generation error after %s attempts",
-                      db_api.MAX_RETRIES)
-        raise n_exc.HostMacAddressGenerationFailure(host=host)
+        max_retries = cfg.CONF.mac_generation_retries
+        for attempt in reversed(range(max_retries)):
+            try:
+                with context.session.begin(subtransactions=True):
+                    mac_address = utils.get_random_mac(base_mac)
+                    dvr_mac_binding = DistributedVirtualRouterMacAddress(
+                        host=host, mac_address=mac_address)
+                    context.session.add(dvr_mac_binding)
+                    LOG.debug("Generated DVR mac for host %(host)s "
+                              "is %(mac_address)s",
+                              {'host': host, 'mac_address': mac_address})
+                dvr_macs = self.get_dvr_mac_address_list(context)
+                # TODO(vivek): improve scalability of this fanout by
+                # sending a single mac address rather than the entire set
+                self.notifier.dvr_mac_address_update(context, dvr_macs)
+                return self._make_dvr_mac_address_dict(dvr_mac_binding)
+            except db_exc.DBDuplicateEntry:
+                LOG.debug("Generated DVR mac %(mac)s exists."
+                          " Remaining attempts %(attempts_left)s.",
+                          {'mac': mac_address, 'attempts_left': attempt})
+        LOG.error(_("MAC generation error after %s attempts"), max_retries)
+        raise ext_dvr.MacAddressGenerationFailure(host=host)
 
-    @db_api.context_manager.reader
+    def delete_dvr_mac_address(self, context, host):
+        query = context.session.query(DistributedVirtualRouterMacAddress)
+        (query.
+         filter(DistributedVirtualRouterMacAddress.host == host).
+         delete(synchronize_session=False))
+
     def get_dvr_mac_address_list(self, context):
-        return [
-            dvr_mac.to_dict()
-            for dvr_mac in router.DVRMacAddress.get_objects(context)
-        ]
+        with context.session.begin(subtransactions=True):
+            return (context.session.
+                    query(DistributedVirtualRouterMacAddress).all())
 
     def get_dvr_mac_address_by_host(self, context, host):
         """Determine the MAC for the DVR port associated to host."""
@@ -131,65 +119,54 @@ class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
 
     def _make_dvr_mac_address_dict(self, dvr_mac_entry, fields=None):
         return {'host': dvr_mac_entry['host'],
-                'mac_address': str(dvr_mac_entry['mac_address'])}
+                'mac_address': dvr_mac_entry['mac_address']}
 
-    @log_helpers.log_method_call
-    @db_api.retry_if_session_inactive()
+    @log.log
     def get_ports_on_host_by_subnet(self, context, host, subnet):
-        """Returns DVR serviced ports on a given subnet in the input host
+        """Returns ports of interest, on a given subnet in the input host
 
         This method returns ports that need to be serviced by DVR.
         :param context: rpc request context
         :param host: host id to match and extract ports of interest
         :param subnet: subnet id to match and extract ports of interest
-        :returns: list -- Ports on the given subnet in the input host
+        :returns list -- Ports on the given subnet in the input host
         """
-        filters = {'fixed_ips': {'subnet_id': [subnet]},
-                   portbindings.HOST_ID: [host]}
-        ports_query = self.plugin._get_ports_query(context, filters=filters)
-        owner_filter = or_(
-            models_v2.Port.device_owner.startswith(
-                constants.DEVICE_OWNER_COMPUTE_PREFIX),
-            models_v2.Port.device_owner.in_(
-                utils.get_other_dvr_serviced_device_owners()))
-        ports_query = ports_query.filter(owner_filter)
-        ports = [
-            self.plugin._make_port_dict(port, process_extensions=False)
-            for port in ports_query.all()
-        ]
+        # FIXME(vivek, salv-orlando): improve this query by adding the
+        # capability of filtering by binding:host_id
+        ports_by_host = []
+        filter = {'fixed_ips': {'subnet_id': [subnet]}}
+        ports = self.plugin.get_ports(context, filters=filter)
+        LOG.debug("List of Ports on subnet %(subnet)s at host %(host)s "
+                  "received as %(ports)s",
+                  {'subnet': subnet, 'host': host, 'ports': ports})
+        for port in ports:
+            device_owner = port['device_owner']
+            if (utils.is_dvr_serviced(device_owner)):
+                if port[portbindings.HOST_ID] == host:
+                    port_dict = self.plugin._make_port_dict(port,
+                        process_extensions=False)
+                    ports_by_host.append(port_dict)
         LOG.debug("Returning list of dvr serviced ports on host %(host)s"
                   " for subnet %(subnet)s ports %(ports)s",
                   {'host': host, 'subnet': subnet,
-                   'ports': ports})
-        return ports
+                   'ports': ports_by_host})
+        return ports_by_host
 
-    @log_helpers.log_method_call
-    @db_api.retry_if_session_inactive()
-    def get_subnet_for_dvr(self, context, subnet, fixed_ips=None):
-        if fixed_ips:
-            subnet_data = fixed_ips[0]['subnet_id']
-        else:
-            subnet_data = subnet
+    @log.log
+    def get_subnet_for_dvr(self, context, subnet):
         try:
-            subnet_info = self.plugin.get_subnet(
-                context, subnet_data)
-        except n_exc.SubnetNotFound:
+            subnet_info = self.plugin.get_subnet(context, subnet)
+        except q_exc.SubnetNotFound:
             return {}
         else:
             # retrieve the gateway port on this subnet
-            if fixed_ips:
-                ip_address = fixed_ips[0]['ip_address']
-            else:
-                ip_address = subnet_info['gateway_ip']
-
             filter = {'fixed_ips': {'subnet_id': [subnet],
-                                    'ip_address': [ip_address]}}
-
+                                    'ip_address': [subnet_info['gateway_ip']]}}
             internal_gateway_ports = self.plugin.get_ports(
                 context, filters=filter)
             if not internal_gateway_ports:
-                LOG.error("Could not retrieve gateway port "
-                          "for subnet %s", subnet_info)
+                LOG.error(_("Could not retrieve gateway port "
+                            "for subnet %s"), subnet_info)
                 return {}
             internal_port = internal_gateway_ports[0]
             subnet_info['gateway_mac'] = internal_port['mac_address']

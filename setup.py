@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # Copyright (c) 2013 Hewlett-Packard Development Company, L.P.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,5 +26,5 @@ except ImportError:
     pass
 
 setuptools.setup(
-    setup_requires=['pbr>=2.0.0'],
+    setup_requires=['pbr'],
     pbr=True)

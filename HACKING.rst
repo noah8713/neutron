@@ -1,40 +1,17 @@
 Neutron Style Commandments
-==========================
+=======================
 
 - Step 1: Read the OpenStack Style Commandments
-  https://docs.openstack.org/hacking/latest/
+  http://docs.openstack.org/developer/hacking/
 - Step 2: Read on
 
 Neutron Specific Commandments
------------------------------
+--------------------------
 
-Some rules are enforced by `neutron-lib hacking factory
-<https://docs.openstack.org/neutron-lib/latest/user/hacking.html>`_
-while other rules are specific to Neutron repository.
-
-Below you can find a list of checks specific to this repository.
-
-- [N322] Detect common errors with assert_called_once_with
-- [N328] Detect wrong usage with assertEqual
-- [N330] Use assertEqual(*empty*, observed) instead of
-         assertEqual(observed, *empty*)
-- [N331] Detect wrong usage with assertTrue(isinstance()).
-- [N332] Use assertEqual(expected_http_code, observed_http_code) instead of
-         assertEqual(observed_http_code, expected_http_code).
-- [N334] Use unittest2 uniformly across Neutron.
-- [N340] Check usage of <module>.i18n (and neutron.i18n)
-- [N341] Check usage of _ from python builtins
-- [N343] Production code must not import from neutron.tests.*
-- [N344] Python 3: Do not use filter(lambda obj: test(obj), data). Replace it
-  with [obj for obj in data if test(obj)].
-
-.. note::
-   When adding a new hacking check to this repository or ``neutron-lib``, make
-   sure its number (Nxxx) doesn't clash with any other check.
-
-.. note::
-   As you may have noticed, the numbering for Neutron checks has gaps. This is
-   because some checks were removed or moved to ``neutron-lib``.
+- [N320] Validate that LOG messages, except debug ones, have translations
+- [N321] Validate that jsonutils module is used instead of json
+- [N322] We do not use @authors tags in source files. We have git to track
+  authorship.
 
 Creating Unit Tests
 -------------------
@@ -46,9 +23,7 @@ without the patch and passes with the patch.
 
 All unittest classes must ultimately inherit from testtools.TestCase. In the
 Neutron test suite, this should be done by inheriting from
-neutron.tests.base.BaseTestCase. If the third party unittest library has to
-be used directly then it is recommended to use unittest2 as it contains bug
-fixes to unittest for all versions of Python prior to version 3.5.
+neutron.tests.base.BaseTestCase.
 
 All setUp and tearDown methods must upcall using the super() method.
 tearDown methods should be avoided and addCleanup calls should be preferred.

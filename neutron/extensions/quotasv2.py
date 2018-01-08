@@ -13,31 +13,26 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api import converters
-from neutron_lib.api import extensions as api_extensions
-from neutron_lib.api import faults
-from neutron_lib.db import constants as const
-from neutron_lib import exceptions as n_exc
-from neutron_lib.plugins import directory
+import sys
+
 from oslo_config import cfg
-from oslo_utils import importutils
 import webob
 
-from neutron._i18n import _
 from neutron.api import extensions
+from neutron.api.v2 import attributes
 from neutron.api.v2 import base
 from neutron.api.v2 import resource
-from neutron.common import exceptions
+from neutron.common import exceptions as n_exc
+from neutron import manager
+from neutron.openstack.common import importutils
 from neutron import quota
-from neutron.quota import resource_registry
 from neutron import wsgi
 
 
-DEFAULT_QUOTAS_ACTION = 'default'
 RESOURCE_NAME = 'quota'
 RESOURCE_COLLECTION = RESOURCE_NAME + "s"
 QUOTAS = quota.QUOTAS
-DB_QUOTA_DRIVER = 'neutron.db.quota.driver.DbQuotaDriver'
+DB_QUOTA_DRIVER = 'neutron.db.quota_db.DbQuotaDriver'
 EXTENDED_ATTRIBUTES_2_0 = {
     RESOURCE_COLLECTION: {}
 }
@@ -54,31 +49,19 @@ class QuotaSetsController(wsgi.Controller):
         self._update_extended_attributes = True
 
     def _update_attributes(self):
-        for quota_resource in resource_registry.get_all_resources().keys():
+        for quota_resource in QUOTAS.resources.iterkeys():
             attr_dict = EXTENDED_ATTRIBUTES_2_0[RESOURCE_COLLECTION]
             attr_dict[quota_resource] = {
                 'allow_post': False,
                 'allow_put': True,
-                'convert_to': converters.convert_to_int,
-                'validate': {'type:range': [-1, const.DB_INTEGER_MAX_VALUE]},
+                'convert_to': attributes.convert_to_int,
+                'validate': {'type:range': [-1, sys.maxsize]},
                 'is_visible': True}
         self._update_extended_attributes = False
 
     def _get_quotas(self, request, tenant_id):
         return self._driver.get_tenant_quotas(
-            request.context,
-            resource_registry.get_all_resources(),
-            tenant_id)
-
-    def default(self, request, id):
-        if id != request.context.tenant_id:
-            self._check_admin(request.context,
-                              reason=_("Only admin is authorized "
-                                       "to access quotas for another tenant"))
-        return {self._resource_name: self._driver.get_default_quotas(
-                   context=request.context,
-                   resources=resource_registry.get_all_resources(),
-                   tenant_id=id)}
+            request.context, QUOTAS.resources, tenant_id)
 
     def create(self, request, body=None):
         msg = _('POST requests are not supported on this resource.')
@@ -88,14 +71,13 @@ class QuotaSetsController(wsgi.Controller):
         context = request.context
         self._check_admin(context)
         return {self._resource_name + "s":
-                self._driver.get_all_quotas(
-                    context, resource_registry.get_all_resources())}
+                self._driver.get_all_quotas(context, QUOTAS.resources)}
 
     def tenant(self, request):
         """Retrieve the tenant info in context."""
         context = request.context
         if not context.tenant_id:
-            raise exceptions.QuotaMissingTenant()
+            raise n_exc.QuotaMissingTenant()
         return {'tenant': {'tenant_id': context.tenant_id}}
 
     def show(self, request, id):
@@ -126,11 +108,8 @@ class QuotaSetsController(wsgi.Controller):
         return {self._resource_name: self._get_quotas(request, id)}
 
 
-class Quotasv2(api_extensions.ExtensionDescriptor):
+class Quotasv2(extensions.ExtensionDescriptor):
     """Quotas management support."""
-
-    extensions.register_custom_supported_check(
-        RESOURCE_COLLECTION, lambda: True, plugin_agnostic=True)
 
     @classmethod
     def get_name(cls):
@@ -148,6 +127,10 @@ class Quotasv2(api_extensions.ExtensionDescriptor):
         return description
 
     @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/network/ext/quotas-sets/api/v2.0"
+
+    @classmethod
     def get_updated(cls):
         return "2012-07-29T10:00:00-00:00"
 
@@ -155,12 +138,11 @@ class Quotasv2(api_extensions.ExtensionDescriptor):
     def get_resources(cls):
         """Returns Ext Resources."""
         controller = resource.Resource(
-            QuotaSetsController(directory.get_plugin()),
-            faults=faults.FAULT_MAP)
+            QuotaSetsController(manager.NeutronManager.get_plugin()),
+            faults=base.FAULT_MAP)
         return [extensions.ResourceExtension(
             Quotasv2.get_alias(),
             controller,
-            member_actions={DEFAULT_QUOTAS_ACTION: 'GET'},
             collection_actions={'tenant': 'GET'})]
 
     def get_extended_resources(self, version):

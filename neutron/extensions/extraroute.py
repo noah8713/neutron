@@ -13,9 +13,62 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api.definitions import extraroute as apidef
-from neutron_lib.api import extensions
+
+from neutron.api.v2 import attributes as attr
+from neutron.common import exceptions as qexception
 
 
-class Extraroute(extensions.APIExtensionDescriptor):
-    api_definition = apidef
+# Extra Routes Exceptions
+class InvalidRoutes(qexception.InvalidInput):
+    message = _("Invalid format for routes: %(routes)s, %(reason)s")
+
+
+class RouterInterfaceInUseByRoute(qexception.InUse):
+    message = _("Router interface for subnet %(subnet_id)s on router "
+                "%(router_id)s cannot be deleted, as it is required "
+                "by one or more routes.")
+
+
+class RoutesExhausted(qexception.BadRequest):
+    message = _("Unable to complete operation for %(router_id)s. "
+                "The number of routes exceeds the maximum %(quota)s.")
+
+# Attribute Map
+EXTENDED_ATTRIBUTES_2_0 = {
+    'routers': {
+        'routes': {'allow_post': False, 'allow_put': True,
+                   'validate': {'type:hostroutes': None},
+                   'convert_to': attr.convert_none_to_empty_list,
+                   'is_visible': True, 'default': attr.ATTR_NOT_SPECIFIED},
+    }
+}
+
+
+class Extraroute():
+
+    @classmethod
+    def get_name(cls):
+        return "Neutron Extra Route"
+
+    @classmethod
+    def get_alias(cls):
+        return "extraroute"
+
+    @classmethod
+    def get_description(cls):
+        return "Extra routes configuration for L3 router"
+
+    @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/ext/neutron/extraroutes/api/v1.0"
+
+    @classmethod
+    def get_updated(cls):
+        return "2013-02-01T10:00:00-00:00"
+
+    def get_extended_resources(self, version):
+        if version == "2.0":
+            attr.PLURALS.update({'routes': 'route'})
+            return EXTENDED_ATTRIBUTES_2_0
+        else:
+            return {}

@@ -14,76 +14,113 @@
 
 import hashlib
 import hmac
+import os
+import socket
+import sys
+
+import eventlet
+eventlet.monkey_patch()
 
 import httplib2
-from neutron_lib import constants
-from neutron_lib import context
+from neutronclient.v2_0 import client
 from oslo_config import cfg
-from oslo_log import log as logging
-import oslo_messaging
-from oslo_service import loopingcall
-from oslo_utils import encodeutils
-import six
 import six.moves.urllib.parse as urlparse
 import webob
 
-from neutron._i18n import _
-from neutron.agent.linux import utils as agent_utils
+from neutron.agent.common import config as agent_conf
 from neutron.agent import rpc as agent_rpc
-from neutron.common import cache_utils as cache
+from neutron.common import config
 from neutron.common import constants as n_const
-from neutron.common import rpc as n_rpc
 from neutron.common import topics
-from neutron.conf.agent.metadata import config
+from neutron.common import utils
+from neutron import context
+from neutron.openstack.common.cache import cache
+from neutron.openstack.common import excutils
+from neutron.openstack.common import log as logging
+from neutron.openstack.common import loopingcall
+from neutron import wsgi
 
 LOG = logging.getLogger(__name__)
 
-MODE_MAP = {
-    config.USER_MODE: 0o644,
-    config.GROUP_MODE: 0o664,
-    config.ALL_MODE: 0o666,
-}
-
-
-class MetadataPluginAPI(object):
-    """Agent-side RPC for metadata agent-to-plugin interaction.
-
-    This class implements the client side of an rpc interface used by the
-    metadata service to make calls back into the Neutron plugin.  The server
-    side is defined in
-    neutron.api.rpc.handlers.metadata_rpc.MetadataRpcCallback.  For more
-    information about changing rpc interfaces, see
-    doc/source/contributor/internals/rpc_api.rst.
-
-    API version history:
-        1.0 - Initial version.
-    """
-
-    def __init__(self, topic):
-        target = oslo_messaging.Target(
-            topic=topic,
-            namespace=n_const.RPC_NAMESPACE_METADATA,
-            version='1.0')
-        self.client = n_rpc.get_client(target)
-
-    def get_ports(self, context, filters):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'get_ports', filters=filters)
-
 
 class MetadataProxyHandler(object):
+    OPTS = [
+        cfg.StrOpt('admin_user',
+                   help=_("Admin user")),
+        cfg.StrOpt('admin_password',
+                   help=_("Admin password"),
+                   secret=True),
+        cfg.StrOpt('admin_tenant_name',
+                   help=_("Admin tenant name")),
+        cfg.StrOpt('auth_url',
+                   help=_("Authentication URL")),
+        cfg.StrOpt('auth_strategy', default='keystone',
+                   help=_("The type of authentication to use")),
+        cfg.StrOpt('auth_region',
+                   help=_("Authentication region")),
+        cfg.BoolOpt('auth_insecure',
+                    default=False,
+                    help=_("Turn off verification of the certificate for"
+                           " ssl")),
+        cfg.StrOpt('auth_ca_cert',
+                   help=_("Certificate Authority public key (CA cert) "
+                          "file for ssl")),
+        cfg.StrOpt('endpoint_type',
+                   default='adminURL',
+                   help=_("Network service endpoint type to pull from "
+                          "the keystone catalog")),
+        cfg.StrOpt('nova_metadata_ip', default='127.0.0.1',
+                   help=_("IP address used by Nova metadata server.")),
+        cfg.IntOpt('nova_metadata_port',
+                   default=8775,
+                   help=_("TCP Port used by Nova metadata server.")),
+        cfg.StrOpt('metadata_proxy_shared_secret',
+                   default='',
+                   help=_('Shared secret to sign instance-id request'),
+                   secret=True),
+        cfg.StrOpt('nova_metadata_protocol',
+                   default='http',
+                   choices=['http', 'https'],
+                   help=_("Protocol to access nova metadata, http or https")),
+        cfg.BoolOpt('nova_metadata_insecure', default=False,
+                    help=_("Allow to perform insecure SSL (https) requests to "
+                           "nova metadata")),
+        cfg.StrOpt('nova_client_cert',
+                   default='',
+                   help=_("Client certificate for nova metadata api server.")),
+        cfg.StrOpt('nova_client_priv_key',
+                   default='',
+                   help=_("Private key of client certificate."))
+    ]
 
     def __init__(self, conf):
         self.conf = conf
-        self._cache = cache.get_cache(self.conf)
+        self.auth_info = {}
+        if self.conf.cache_url:
+            self._cache = cache.get_cache(self.conf.cache_url)
+        else:
+            self._cache = False
 
-        self.plugin_rpc = MetadataPluginAPI(topics.PLUGIN)
-        self.context = context.get_admin_context_without_session()
+    def _get_neutron_client(self):
+        qclient = client.Client(
+            username=self.conf.admin_user,
+            password=self.conf.admin_password,
+            tenant_name=self.conf.admin_tenant_name,
+            auth_url=self.conf.auth_url,
+            auth_strategy=self.conf.auth_strategy,
+            region_name=self.conf.auth_region,
+            token=self.auth_info.get('auth_token'),
+            insecure=self.conf.auth_insecure,
+            ca_cert=self.conf.auth_ca_cert,
+            endpoint_url=self.auth_info.get('endpoint_url'),
+            endpoint_type=self.conf.endpoint_type
+        )
+        return qclient
 
     @webob.dec.wsgify(RequestClass=webob.Request)
     def __call__(self, req):
         try:
-            LOG.debug("Request: %s", req)
+            LOG.debug(_("Request: %s"), req)
 
             instance_id, tenant_id = self._get_instance_and_tenant_id(req)
             if instance_id:
@@ -92,38 +129,24 @@ class MetadataProxyHandler(object):
                 return webob.exc.HTTPNotFound()
 
         except Exception:
-            LOG.exception("Unexpected error.")
+            LOG.exception(_("Unexpected error."))
             msg = _('An unknown error has occurred. '
                     'Please try your request again.')
-            explanation = six.text_type(msg)
-            return webob.exc.HTTPInternalServerError(explanation=explanation)
+            return webob.exc.HTTPInternalServerError(explanation=unicode(msg))
 
-    def _get_ports_from_server(self, router_id=None, ip_address=None,
-                               networks=None):
-        """Get ports from server."""
-        filters = self._get_port_filters(router_id, ip_address, networks)
-        return self.plugin_rpc.get_ports(self.context, filters)
-
-    def _get_port_filters(self, router_id=None, ip_address=None,
-                          networks=None):
-        filters = {}
-        if router_id:
-            filters['device_id'] = [router_id]
-            filters['device_owner'] = constants.ROUTER_INTERFACE_OWNERS
-        if ip_address:
-            filters['fixed_ips'] = {'ip_address': [ip_address]}
-        if networks:
-            filters['network_id'] = networks
-
-        return filters
-
-    @cache.cache_method_results
+    @utils.cache_method_results
     def _get_router_networks(self, router_id):
         """Find all networks connected to given router."""
-        internal_ports = self._get_ports_from_server(router_id=router_id)
+        qclient = self._get_neutron_client()
+
+        internal_ports = qclient.list_ports(
+            device_id=router_id,
+            device_owner=[n_const.DEVICE_OWNER_ROUTER_INTF,
+                          n_const.DEVICE_OWNER_DVR_INTERFACE])['ports']
+        self.auth_info = qclient.get_auth_info()
         return tuple(p['network_id'] for p in internal_ports)
 
-    @cache.cache_method_results
+    @utils.cache_method_results
     def _get_ports_for_remote_address(self, remote_address, networks):
         """Get list of ports that has given ip address and are part of
         given networks.
@@ -132,8 +155,13 @@ class MetadataProxyHandler(object):
                          searched for
 
         """
-        return self._get_ports_from_server(networks=networks,
-                                           ip_address=remote_address)
+        qclient = self._get_neutron_client()
+        all_ports = qclient.list_ports(
+            fixed_ips=['ip_address=%s' % remote_address])['ports']
+
+        self.auth_info = qclient.get_auth_info()
+        networks = set(networks)
+        return [p for p in all_ports if p['network_id'] in networks]
 
     def _get_ports(self, remote_address, network_id=None, router_id=None):
         """Search for all ports that contain passed ip address and belongs to
@@ -159,11 +187,6 @@ class MetadataProxyHandler(object):
         router_id = req.headers.get('X-Neutron-Router-ID')
 
         ports = self._get_ports(remote_address, network_id, router_id)
-        LOG.debug("Gotten ports for remote_address %(remote_address)s, "
-                  "network_id %(network_id)s, router_id %(router_id)s are: "
-                  "%(ports)s", {"remote_address": remote_address,
-                  "network_id": network_id, "router_id": router_id,
-                  "ports": ports})
 
         if len(ports) == 1:
             return ports[0]['device_id'], ports[0]['tenant_id']
@@ -177,36 +200,36 @@ class MetadataProxyHandler(object):
             'X-Instance-ID-Signature': self._sign_instance_id(instance_id)
         }
 
-        nova_host_port = '%s:%s' % (self.conf.nova_metadata_host,
-                                    self.conf.nova_metadata_port)
+        nova_ip_port = '%s:%s' % (self.conf.nova_metadata_ip,
+                                  self.conf.nova_metadata_port)
         url = urlparse.urlunsplit((
             self.conf.nova_metadata_protocol,
-            nova_host_port,
+            nova_ip_port,
             req.path_info,
             req.query_string,
             ''))
 
-        h = httplib2.Http(
-            ca_certs=self.conf.auth_ca_cert,
-            disable_ssl_certificate_validation=self.conf.nova_metadata_insecure
-        )
+        h = httplib2.Http(ca_certs=self.conf.auth_ca_cert,
+                          disable_ssl_certificate_validation=
+                          self.conf.nova_metadata_insecure)
         if self.conf.nova_client_cert and self.conf.nova_client_priv_key:
             h.add_certificate(self.conf.nova_client_priv_key,
                               self.conf.nova_client_cert,
-                              nova_host_port)
+                              nova_ip_port)
         resp, content = h.request(url, method=req.method, headers=headers,
                                   body=req.body)
 
         if resp.status == 200:
+            LOG.debug(str(resp))
             req.response.content_type = resp['content-type']
             req.response.body = content
-            LOG.debug(str(resp))
             return req.response
         elif resp.status == 403:
-            LOG.warning(
+            msg = _(
                 'The remote metadata server responded with Forbidden. This '
                 'response usually occurs when shared secrets do not match.'
             )
+            LOG.warn(msg)
             return webob.exc.HTTPForbidden()
         elif resp.status == 400:
             return webob.exc.HTTPBadRequest()
@@ -218,41 +241,102 @@ class MetadataProxyHandler(object):
             msg = _(
                 'Remote metadata server experienced an internal server error.'
             )
-            LOG.warning(msg)
-            explanation = six.text_type(msg)
-            return webob.exc.HTTPInternalServerError(explanation=explanation)
+            LOG.warn(msg)
+            return webob.exc.HTTPInternalServerError(explanation=unicode(msg))
         else:
             raise Exception(_('Unexpected response code: %s') % resp.status)
 
     def _sign_instance_id(self, instance_id):
-        secret = self.conf.metadata_proxy_shared_secret
-        secret = encodeutils.to_utf8(secret)
-        instance_id = encodeutils.to_utf8(instance_id)
-        return hmac.new(secret, instance_id, hashlib.sha256).hexdigest()
+        return hmac.new(self.conf.metadata_proxy_shared_secret,
+                        instance_id,
+                        hashlib.sha256).hexdigest()
+
+
+class UnixDomainHttpProtocol(eventlet.wsgi.HttpProtocol):
+    def __init__(self, request, client_address, server):
+        if client_address == '':
+            client_address = ('<local>', 0)
+        # base class is old-style, so super does not work properly
+        eventlet.wsgi.HttpProtocol.__init__(self, request, client_address,
+                                            server)
+
+
+class WorkerService(wsgi.WorkerService):
+    def start(self):
+        self._server = self._service.pool.spawn(self._service._run,
+                                                self._application,
+                                                self._service._socket)
+
+
+class UnixDomainWSGIServer(wsgi.Server):
+    def __init__(self, name):
+        self._socket = None
+        self._launcher = None
+        self._server = None
+        super(UnixDomainWSGIServer, self).__init__(name)
+
+    def start(self, application, file_socket, workers, backlog):
+        self._socket = eventlet.listen(file_socket,
+                                       family=socket.AF_UNIX,
+                                       backlog=backlog)
+
+        self._launch(application, workers=workers)
+
+    def _run(self, application, socket):
+        """Start a WSGI service in a new green thread."""
+        logger = logging.getLogger('eventlet.wsgi.server')
+        eventlet.wsgi.server(socket,
+                             application,
+                             custom_pool=self.pool,
+                             protocol=UnixDomainHttpProtocol,
+                             log=logging.WritableLogger(logger))
 
 
 class UnixDomainMetadataProxy(object):
+    OPTS = [
+        cfg.StrOpt('metadata_proxy_socket',
+                   default='$state_path/metadata_proxy',
+                   help=_('Location for Metadata Proxy UNIX domain socket')),
+        cfg.IntOpt('metadata_workers',
+                   default=utils.cpu_count() // 2,
+                   help=_('Number of separate worker processes for metadata '
+                          'server')),
+        cfg.IntOpt('metadata_backlog',
+                   default=4096,
+                   help=_('Number of backlog requests to configure the '
+                          'metadata server socket with'))
+    ]
 
     def __init__(self, conf):
         self.conf = conf
-        agent_utils.ensure_directory_exists_without_file(
-            cfg.CONF.metadata_proxy_socket)
+
+        dirname = os.path.dirname(cfg.CONF.metadata_proxy_socket)
+        if os.path.isdir(dirname):
+            try:
+                os.unlink(cfg.CONF.metadata_proxy_socket)
+            except OSError:
+                with excutils.save_and_reraise_exception() as ctxt:
+                    if not os.path.exists(cfg.CONF.metadata_proxy_socket):
+                        ctxt.reraise = False
+        else:
+            os.makedirs(dirname, 0o755)
+
+        self._init_state_reporting()
 
     def _init_state_reporting(self):
         self.context = context.get_admin_context_without_session()
-        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.REPORTS)
+        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
         self.agent_state = {
             'binary': 'neutron-metadata-agent',
             'host': cfg.CONF.host,
             'topic': 'N/A',
             'configurations': {
                 'metadata_proxy_socket': cfg.CONF.metadata_proxy_socket,
-                'nova_metadata_host': cfg.CONF.nova_metadata_host,
+                'nova_metadata_ip': cfg.CONF.nova_metadata_ip,
                 'nova_metadata_port': cfg.CONF.nova_metadata_port,
-                'log_agent_heartbeats': cfg.CONF.AGENT.log_agent_heartbeats,
             },
             'start_flag': True,
-            'agent_type': constants.AGENT_TYPE_METADATA}
+            'agent_type': n_const.AGENT_TYPE_METADATA}
         report_interval = cfg.CONF.AGENT.report_interval
         if report_interval:
             self.heartbeat = loopingcall.FixedIntervalLoopingCall(
@@ -267,39 +351,32 @@ class UnixDomainMetadataProxy(object):
                 use_call=self.agent_state.get('start_flag'))
         except AttributeError:
             # This means the server does not support report_state
-            LOG.warning('Neutron server does not support state report.'
-                        ' State report for this agent will be disabled.')
+            LOG.warn(_('Neutron server does not support state report.'
+                       ' State report for this agent will be disabled.'))
             self.heartbeat.stop()
             return
         except Exception:
-            LOG.exception("Failed reporting state!")
+            LOG.exception(_("Failed reporting state!"))
             return
         self.agent_state.pop('start_flag', None)
 
-    def _get_socket_mode(self):
-        mode = self.conf.metadata_proxy_socket_mode
-        if mode == config.DEDUCE_MODE:
-            user = self.conf.metadata_proxy_user
-            if (not user or user == '0' or user == 'root'
-                    or agent_utils.is_effective_user(user)):
-                # user is agent effective user or root => USER_MODE
-                mode = config.USER_MODE
-            else:
-                group = self.conf.metadata_proxy_group
-                if not group or agent_utils.is_effective_group(group):
-                    # group is agent effective group => GROUP_MODE
-                    mode = config.GROUP_MODE
-                else:
-                    # otherwise => ALL_MODE
-                    mode = config.ALL_MODE
-        return MODE_MAP[mode]
-
     def run(self):
-        server = agent_utils.UnixDomainWSGIServer('neutron-metadata-agent')
+        server = UnixDomainWSGIServer('neutron-metadata-agent')
         server.start(MetadataProxyHandler(self.conf),
                      self.conf.metadata_proxy_socket,
                      workers=self.conf.metadata_workers,
-                     backlog=self.conf.metadata_backlog,
-                     mode=self._get_socket_mode())
-        self._init_state_reporting()
+                     backlog=self.conf.metadata_backlog)
         server.wait()
+
+
+def main():
+    cfg.CONF.register_opts(UnixDomainMetadataProxy.OPTS)
+    cfg.CONF.register_opts(MetadataProxyHandler.OPTS)
+    cache.register_oslo_configs(cfg.CONF)
+    cfg.CONF.set_default(name='cache_url', default='memory://?default_ttl=5')
+    agent_conf.register_agent_state_opts_helper(cfg.CONF)
+    config.init(sys.argv[1:])
+    config.setup_logging()
+    utils.log_opt_values(LOG)
+    proxy = UnixDomainMetadataProxy(cfg.CONF)
+    proxy.run()

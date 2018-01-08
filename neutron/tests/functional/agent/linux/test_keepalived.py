@@ -15,88 +15,46 @@
 
 from oslo_config import cfg
 
-from neutron._i18n import _
+from neutron.agent.common import config
 from neutron.agent.linux import external_process
 from neutron.agent.linux import keepalived
-from neutron.agent.linux import utils
-from neutron.common import utils as common_utils
-from neutron.tests.functional.agent.linux import helpers
-from neutron.tests.functional import base
+from neutron.openstack.common import log as logging
+from neutron.tests.functional import base as functional_base
 from neutron.tests.unit.agent.linux import test_keepalived
 
+LOG = logging.getLogger(__name__)
 
-class KeepalivedManagerTestCase(base.BaseLoggingTestCase,
+
+class KeepalivedManagerTestCase(functional_base.BaseSudoTestCase,
                                 test_keepalived.KeepalivedConfBaseMixin):
-
     def setUp(self):
         super(KeepalivedManagerTestCase, self).setUp()
-        cfg.CONF.set_override('check_child_processes_interval', 1, 'AGENT')
+        self.check_sudo_enabled()
+        self._configure()
 
-        self.expected_config = self._get_config()
-        self.process_monitor = external_process.ProcessMonitor(cfg.CONF,
-                                                               'router')
-        self.manager = keepalived.KeepalivedManager(
-            'router1', self.expected_config, self.process_monitor,
-            conf_path=cfg.CONF.state_path)
-        self.addCleanup(self.manager.disable)
-
-    def _spawn_keepalived(self, keepalived_manager):
-        keepalived_manager.spawn()
-        process = keepalived_manager.get_process()
-        common_utils.wait_until_true(
-            lambda: process.active,
-            timeout=5,
-            sleep=0.01,
-            exception=RuntimeError(_("Keepalived didn't spawn")))
-        return process
+    def _configure(self):
+        cfg.CONF.set_override('debug', True)
+        config.setup_logging()
+        config.register_root_helper(cfg.CONF)
+        cfg.CONF.set_override('root_helper', self.root_helper, group='AGENT')
 
     def test_keepalived_spawn(self):
-        self._spawn_keepalived(self.manager)
+        expected_config = self._get_config()
+        manager = keepalived.KeepalivedManager('router1', expected_config,
+                                               conf_path=cfg.CONF.state_path,
+                                               root_helper=self.root_helper)
+        self.addCleanup(manager.disable)
 
-        self.assertEqual(self.expected_config.get_config_str(),
-                         self.manager.get_conf_on_disk())
+        manager.spawn()
+        process = external_process.ProcessManager(
+            cfg.CONF,
+            'router1',
+            self.root_helper,
+            namespace=None,
+            pids_path=cfg.CONF.state_path)
+        self.assertTrue(process.active)
 
-    def _test_keepalived_respawns(self, normal_exit=True):
-        process = self._spawn_keepalived(self.manager)
-        pid = process.pid
-        exit_code = '-15' if normal_exit else '-9'
-
-        # Exit the process, and see that when it comes back
-        # It's indeed a different process
-        utils.execute(['kill', exit_code, pid])
-        common_utils.wait_until_true(
-            lambda: process.active and pid != process.pid,
-            timeout=5,
-            sleep=0.01,
-            exception=RuntimeError(_("Keepalived didn't respawn")))
-
-    def test_keepalived_respawns(self):
-        self._test_keepalived_respawns()
-
-    def test_keepalived_respawn_with_unexpected_exit(self):
-        self._test_keepalived_respawns(False)
-
-    def _test_keepalived_spawns_conflicting_pid(self, process, pid_file):
-        # Test the situation when keepalived PID file contains PID of an
-        # existing non-keepalived process. This situation can happen e.g.
-        # after hard node reset.
-
-        spawn_process = helpers.SleepyProcessFixture()
-        self.useFixture(spawn_process)
-
-        with open(pid_file, "w") as f_pid_file:
-            f_pid_file.write("%s" % spawn_process.pid)
-
-        self._spawn_keepalived(self.manager)
-
-    def test_keepalived_spawns_conflicting_pid_base_process(self):
-        process = self.manager.get_process()
-        pid_file = process.get_pid_file_name()
-        self._test_keepalived_spawns_conflicting_pid(process, pid_file)
-
-    def test_keepalived_spawns_conflicting_pid_vrrp_subprocess(self):
-        process = self.manager.get_process()
-        pid_file = process.get_pid_file_name()
-        self._test_keepalived_spawns_conflicting_pid(
-            process,
-            self.manager.get_vrrp_pid_file_name(pid_file))
+        config_path = manager._get_full_config_file_path('keepalived.conf')
+        with open(config_path, 'r') as config_file:
+            config_contents = config_file.read()
+        self.assertEqual(expected_config.get_config_str(), config_contents)

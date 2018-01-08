@@ -13,92 +13,108 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from keystoneauth1 import loading as ks_loading
-from neutron_lib.callbacks import events
-from neutron_lib.callbacks import registry
-from neutron_lib.callbacks import resources
-from neutron_lib import constants
-from neutron_lib import context
-from neutron_lib import exceptions as exc
-from neutron_lib.plugins import directory
-from novaclient import api_versions
-from novaclient import client as nova_client
+import eventlet
 from novaclient import exceptions as nova_exceptions
+import novaclient.v1_1.client as nclient
+from novaclient.v1_1.contrib import server_external_events
 from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_utils import uuidutils
 from sqlalchemy.orm import attributes as sql_attr
 
-from neutron.notifiers import batch_notifier
+from neutron.common import constants
+from neutron import context
+from neutron import manager
+from neutron.openstack.common import log as logging
+from neutron.openstack.common import uuidutils
 
 
 LOG = logging.getLogger(__name__)
 
 VIF_UNPLUGGED = 'network-vif-unplugged'
 VIF_PLUGGED = 'network-vif-plugged'
-VIF_DELETED = 'network-vif-deleted'
 NEUTRON_NOVA_EVENT_STATUS_MAP = {constants.PORT_STATUS_ACTIVE: 'completed',
                                  constants.PORT_STATUS_ERROR: 'failed',
                                  constants.PORT_STATUS_DOWN: 'completed'}
-NOVA_API_VERSION = "2.1"
 
 
-@registry.has_registry_receivers
 class Notifier(object):
 
-    _instance = None
-
-    @classmethod
-    def get_instance(cls):
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
     def __init__(self):
-        auth = ks_loading.load_auth_from_conf_options(cfg.CONF, 'nova')
+        # TODO(arosen): we need to cache the endpoints and figure out
+        # how to deal with different regions here....
+        bypass_url = "%s/%s" % (cfg.CONF.nova_url,
+                                cfg.CONF.nova_admin_tenant_id)
+        self.nclient = nclient.Client(
+            username=cfg.CONF.nova_admin_username,
+            api_key=cfg.CONF.nova_admin_password,
+            project_id=None,
+            tenant_id=cfg.CONF.nova_admin_tenant_id,
+            auth_url=cfg.CONF.nova_admin_auth_url,
+            cacert=cfg.CONF.nova_ca_certificates_file,
+            insecure=cfg.CONF.nova_api_insecure,
+            bypass_url=bypass_url,
+            region_name=cfg.CONF.nova_region_name,
+            extensions=[server_external_events])
+        self.pending_events = []
+        self._waiting_to_send = False
 
-        session = ks_loading.load_session_from_conf_options(
-            cfg.CONF,
-            'nova',
-            auth=auth)
+    def queue_event(self, event):
+        """Called to queue sending an event with the next batch of events.
 
-        extensions = [
-            ext for ext in nova_client.discover_extensions(NOVA_API_VERSION)
-            if ext.name == "server_external_events"]
-        self.nclient = nova_client.Client(
-            api_versions.APIVersion(NOVA_API_VERSION),
-            session=session,
-            region_name=cfg.CONF.nova.region_name,
-            endpoint_type=cfg.CONF.nova.endpoint_type,
-            extensions=extensions)
-        self.batch_notifier = batch_notifier.BatchNotifier(
-            cfg.CONF.send_events_interval, self.send_events)
+        Sending events individually, as they occur, has been problematic as it
+        can result in a flood of sends.  Previously, there was a loopingcall
+        thread that would send batched events on a periodic interval.  However,
+        maintaining a persistent thread in the loopingcall was also
+        problematic.
+
+        This replaces the loopingcall with a mechanism that creates a
+        short-lived thread on demand when the first event is queued.  That
+        thread will sleep once for the same send_events_interval to allow other
+        events to queue up in pending_events and then will send them when it
+        wakes.
+
+        If a thread is already alive and waiting, this call will simply queue
+        the event and return leaving it up to the thread to send it.
+
+        :param event: the event that occurred.
+        """
+        if not event:
+            return
+
+        self.pending_events.append(event)
+
+        if self._waiting_to_send:
+            return
+
+        self._waiting_to_send = True
+
+        def last_out_sends():
+            eventlet.sleep(cfg.CONF.send_events_interval)
+            self._waiting_to_send = False
+            self.send_events()
+
+        eventlet.spawn_n(last_out_sends)
 
     def _is_compute_port(self, port):
         try:
             if (port['device_id'] and uuidutils.is_uuid_like(port['device_id'])
-                    and port['device_owner'].startswith(
-                        constants.DEVICE_OWNER_COMPUTE_PREFIX)):
+                    and port['device_owner'].startswith('compute:')):
                 return True
         except (KeyError, AttributeError):
             pass
         return False
 
-    def _get_network_changed_event(self, port):
+    def _get_network_changed_event(self, device_id):
         return {'name': 'network-changed',
-                'server_uuid': port['device_id'],
-                'tag': port['id']}
+                'server_uuid': device_id}
 
-    def _get_port_delete_event(self, port):
-        return {'server_uuid': port['device_id'],
-                'name': VIF_DELETED,
-                'tag': port['id']}
-
-    @registry.receives(resources.PORT, [events.BEFORE_RESPONSE])
-    @registry.receives(resources.FLOATING_IP, [events.BEFORE_RESPONSE])
-    def _send_nova_notification(self, resource, event, trigger, payload=None):
-        self.send_network_change(payload.action, payload.states[0],
-                                 payload.latest_state)
+    @property
+    def _plugin(self):
+        # NOTE(arosen): this cannot be set in __init__ currently since
+        # this class is initialized at the same time as NeutronManager()
+        # which is decorated with synchronized()
+        if not hasattr(self, '_plugin_ref'):
+            self._plugin_ref = manager.NeutronManager.get_plugin()
+        return self._plugin_ref
 
     def send_network_change(self, action, original_obj,
                             returned_obj):
@@ -122,15 +138,15 @@ class Notifier(object):
             disassociate_returned_obj = {'floatingip': {'port_id': None}}
             event = self.create_port_changed_event(action, original_obj,
                                                    disassociate_returned_obj)
-            self.batch_notifier.queue_event(event)
+            self.queue_event(event)
 
         event = self.create_port_changed_event(action, original_obj,
                                                returned_obj)
-        self.batch_notifier.queue_event(event)
+        self.queue_event(event)
 
     def create_port_changed_event(self, action, original_obj, returned_obj):
         port = None
-        if action in ['update_port', 'delete_port']:
+        if action == 'update_port':
             port = returned_obj['port']
 
         elif action in ['update_floatingip', 'create_floatingip',
@@ -145,35 +161,10 @@ class Notifier(object):
                 return
 
             ctx = context.get_admin_context()
-            try:
-                port = directory.get_plugin().get_port(ctx, port_id)
-            except exc.PortNotFound:
-                LOG.debug("Port %s was deleted, no need to send any "
-                          "notification", port_id)
-                return
+            port = self._plugin.get_port(ctx, port_id)
 
         if port and self._is_compute_port(port):
-            if action == 'delete_port':
-                return self._get_port_delete_event(port)
-            else:
-                return self._get_network_changed_event(port)
-
-    def _can_notify(self, port):
-        if not port.id:
-            LOG.warning("Port ID not set! Nova will not be notified of "
-                        "port status change.")
-            return False
-
-        # If there is no device_id set there is nothing we can do here.
-        if not port.device_id:
-            LOG.debug("device_id is not set on port %s yet.", port.id)
-            return False
-
-        # We only want to notify about nova ports.
-        if not self._is_compute_port(port):
-            return False
-
-        return True
+            return self._get_network_changed_event(port['device_id'])
 
     def record_port_status_changed(self, port, current_port_status,
                                    previous_port_status, initiator):
@@ -181,8 +172,20 @@ class Notifier(object):
         """
         # clear out previous _notify_event
         port._notify_event = None
-        if not self._can_notify(port):
+        # If there is no device_id set there is nothing we can do here.
+        if not port.device_id:
+            LOG.debug(_("device_id is not set on port yet."))
             return
+
+        if not port.id:
+            LOG.warning(_("Port ID not set! Nova will not be notified of "
+                          "port status change."))
+            return
+
+        # We only want to notify about nova ports.
+        if not self._is_compute_port(port):
+            return
+
         # We notify nova when a vif is unplugged which only occurs when
         # the status goes from ACTIVE to DOWN.
         if (previous_port_status == constants.PORT_STATUS_ACTIVE and
@@ -200,9 +203,9 @@ class Notifier(object):
             event_name = VIF_PLUGGED
         # All the remaining state transitions are of no interest to nova
         else:
-            LOG.debug("Ignoring state change previous_port_status: "
-                      "%(pre_status)s current_port_status: %(cur_status)s"
-                      " port_id %(id)s",
+            LOG.debug(_("Ignoring state change previous_port_status: "
+                        "%(pre_status)s current_port_status: %(cur_status)s"
+                        " port_id %(id)s") %
                       {'pre_status': previous_port_status,
                        'cur_status': current_port_status,
                        'id': port.id})
@@ -216,41 +219,29 @@ class Notifier(object):
 
     def send_port_status(self, mapper, connection, port):
         event = getattr(port, "_notify_event", None)
-        self.batch_notifier.queue_event(event)
+        self.queue_event(event)
         port._notify_event = None
 
-    def notify_port_active_direct(self, port):
-        """Notify nova about active port
-
-        Used when port was wired on the host other than port's current host
-        according to port binding. This happens during live migration.
-        In this case ml2 plugin skips port status update but we still we need
-        to notify nova.
-        """
-        if not self._can_notify(port):
+    def send_events(self):
+        if not self.pending_events:
             return
 
-        port._notify_event = (
-            {'server_uuid': port.device_id,
-             'name': VIF_PLUGGED,
-             'status': 'completed',
-             'tag': port.id})
-        self.send_port_status(None, None, port)
+        batched_events = self.pending_events
+        self.pending_events = []
 
-    def send_events(self, batched_events):
-        LOG.debug("Sending events: %s", batched_events)
+        LOG.debug(_("Sending events: %s"), batched_events)
         try:
             response = self.nclient.server_external_events.create(
                 batched_events)
         except nova_exceptions.NotFound:
-            LOG.debug("Nova returned NotFound for event: %s",
-                      batched_events)
+            LOG.warning(_("Nova returned NotFound for event: %s"),
+                        batched_events)
         except Exception:
-            LOG.exception("Failed to notify nova on events: %s",
+            LOG.exception(_("Failed to notify nova on events: %s"),
                           batched_events)
         else:
             if not isinstance(response, list):
-                LOG.error("Error response returned from nova: %s",
+                LOG.error(_("Error response returned from nova: %s"),
                           response)
                 return
             response_error = False
@@ -261,10 +252,10 @@ class Notifier(object):
                     response_error = True
                     continue
                 if code != 200:
-                    LOG.warning("Nova event: %s returned with failed "
-                                "status", event)
+                    LOG.warning(_("Nova event: %s returned with failed "
+                                  "status"), event)
                 else:
-                    LOG.info("Nova event response: %s", event)
+                    LOG.info(_("Nova event response: %s"), event)
             if response_error:
-                LOG.error("Error response returned from nova: %s",
+                LOG.error(_("Error response returned from nova: %s"),
                           response)

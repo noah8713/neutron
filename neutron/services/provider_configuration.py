@@ -13,165 +13,45 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import importlib
-import itertools
-import os
-
-from neutron_lib.db import constants as db_const
-from neutron_lib import exceptions as n_exc
 from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_log import versionutils
-import stevedore
 
-from neutron._i18n import _
-from neutron.conf.services import provider_configuration as prov_config
-from neutron.db import _utils as db_utils
+from neutron.common import exceptions as n_exc
+from neutron.openstack.common import log as logging
+from neutron.plugins.common import constants
 
 LOG = logging.getLogger(__name__)
 
-SERVICE_PROVIDERS = 'neutron.service_providers'
 
-# TODO(HenryG): use MovedGlobals to deprecate this.
-serviceprovider_opts = prov_config.serviceprovider_opts
+serviceprovider_opts = [
+    cfg.MultiStrOpt('service_provider', default=[],
+                    help=_('Defines providers for advanced services '
+                           'using the format: '
+                           '<service_type>:<name>:<driver>[:default]'))
+]
 
-prov_config.register_service_provider_opts()
-
-
-class NeutronModule(object):
-    """A Neutron extension module."""
-
-    def __init__(self, service_module):
-        self.module_name = service_module
-        self.repo = {
-            'mod': self._import_or_none(),
-            'ini': None
-        }
-
-    def _import_or_none(self):
-        try:
-            return importlib.import_module(self.module_name)
-        except ImportError:
-            return None
-
-    def installed(self):
-        LOG.debug("NeutronModule installed = %s", self.module_name)
-        return self.module_name
-
-    def module(self):
-        return self.repo['mod']
-
-    # Return an INI parser for the child module
-    def ini(self, neutron_dir=None):
-        if self.repo['ini'] is None:
-            ini_file = cfg.ConfigOpts()
-            prov_config.register_service_provider_opts(ini_file)
-
-            if neutron_dir is not None:
-                neutron_dirs = [neutron_dir]
-            else:
-                try:
-                    neutron_dirs = cfg.CONF.config_dirs
-                except cfg.NoSuchOptError:
-                    neutron_dirs = None
-                if not neutron_dirs:
-                    neutron_dirs = ['/etc/neutron']
-
-            # load configuration from all matching files to reflect oslo.config
-            # behaviour
-            config_files = []
-            for neutron_dir in neutron_dirs:
-                ini_path = os.path.join(neutron_dir,
-                                        '%s.conf' % self.module_name)
-                if os.path.exists(ini_path):
-                    config_files.append(ini_path)
-
-            # NOTE(ihrachys): we could pass project=self.module_name instead to
-            # rely on oslo.config to find configuration files for us, but:
-            # 1. that would render neutron_dir argument ineffective;
-            # 2. that would break loading configuration file from under
-            # /etc/neutron in case no --config-dir is passed.
-            # That's why we need to explicitly construct CLI here.
-            ini_file(args=list(itertools.chain.from_iterable(
-                ['--config-file', file_] for file_ in config_files
-            )))
-            self.repo['ini'] = ini_file
-
-        return self.repo['ini']
-
-    def service_providers(self):
-        """Return the service providers for the extension module."""
-        providers = []
-        # Attempt to read the config from cfg.CONF first; when passing
-        # --config-dir, the option is merged from all the definitions
-        # made across all the imported config files
-        try:
-            providers = cfg.CONF.service_providers.service_provider
-        except cfg.NoSuchOptError:
-            pass
-
-        # Alternatively, if the option is not available, try to load
-        # it from the provider module's config file; this may be
-        # necessary, if modules are loaded on the fly (DevStack may
-        # be an example)
-        if not providers:
-            providers = self.ini().service_providers.service_provider
-
-            if providers:
-                versionutils.report_deprecated_feature(
-                    LOG,
-                    'Implicit loading of service providers from '
-                    'neutron_*.conf files is deprecated and will be '
-                    'removed in Ocata release.')
-
-        return providers
+cfg.CONF.register_opts(serviceprovider_opts, 'service_providers')
 
 
-# global scope function that should be used in service APIs
+#global scope function that should be used in service APIs
 def normalize_provider_name(name):
     return name.lower()
 
 
-def get_provider_driver_class(driver, namespace=SERVICE_PROVIDERS):
-    """Return path to provider driver class
-
-    In order to keep backward compatibility with configs < Kilo, we need to
-    translate driver class paths after advanced services split. This is done by
-    defining old class path as entry point in neutron package.
-    """
-    try:
-        driver_manager = stevedore.driver.DriverManager(
-            namespace, driver).driver
-    except ImportError:
-        return driver
-    except RuntimeError:
-        return driver
-    new_driver = "%s.%s" % (driver_manager.__module__,
-                            driver_manager.__name__)
-    LOG.warning(
-        "The configured driver %(driver)s has been moved, automatically "
-        "using %(new_driver)s instead. Please update your config files, "
-        "as this automatic fixup will be removed in a future release.",
-        {'driver': driver, 'new_driver': new_driver})
-    return new_driver
-
-
-def parse_service_provider_opt(service_module='neutron'):
-
+def parse_service_provider_opt():
     """Parse service definition opts and returns result."""
     def validate_name(name):
-        if len(name) > db_const.NAME_FIELD_SIZE:
+        if len(name) > 255:
             raise n_exc.Invalid(
-                _("Provider name %(name)s is limited by %(len)s characters")
-                % {'name': name, 'len': db_const.NAME_FIELD_SIZE})
+                _("Provider name is limited by 255 characters: %s") % name)
 
-    neutron_mod = NeutronModule(service_module)
-    svc_providers_opt = neutron_mod.service_providers()
-
-    LOG.debug("Service providers = %s", svc_providers_opt)
-
+    svc_providers_opt = cfg.CONF.service_providers.service_provider
+    # To support multiple services in the same line, comma seperated
+    flattened_svc_providers_opt = []
+    for prov in svc_providers_opt:
+        prov = prov.split(',')
+        flattened_svc_providers_opt.extend(prov)
     res = []
-    for prov_def in svc_providers_opt:
+    for prov_def in flattened_svc_providers_opt:
         split = prov_def.split(':')
         try:
             svc_type, name, driver = split[:3]
@@ -189,8 +69,13 @@ def parse_service_provider_opt(service_module='neutron'):
                        prov_def)
                 LOG.error(msg)
                 raise n_exc.Invalid(msg)
-
-        driver = get_provider_driver_class(driver)
+        if svc_type not in constants.ALLOWED_SERVICES:
+            msg = (_("Service type '%(svc_type)s' is not allowed, "
+                     "allowed types: %(allowed)s") %
+                   {'svc_type': svc_type,
+                    'allowed': constants.ALLOWED_SERVICES})
+            LOG.error(msg)
+            raise n_exc.Invalid(msg)
         res.append({'service_type': svc_type,
                     'name': name,
                     'driver': driver,
@@ -214,18 +99,17 @@ class ServiceProviderAlreadyAssociated(n_exc.Conflict):
 
 
 class ProviderConfiguration(object):
-
-    def __init__(self, svc_module='neutron'):
+    def __init__(self, prov_data):
         self.providers = {}
-        for prov in parse_service_provider_opt(svc_module):
+        for prov in prov_data:
             self.add_provider(prov)
 
     def _ensure_driver_unique(self, driver):
-        for v in self.providers.values():
+        for k, v in self.providers.items():
             if v['driver'] == driver:
                 msg = (_("Driver %s is not unique across providers") %
                        driver)
-                LOG.error(msg)
+                LOG.exception(msg)
                 raise n_exc.Invalid(msg)
 
     def _ensure_default_unique(self, type, default):
@@ -235,7 +119,7 @@ class ProviderConfiguration(object):
             if k[0] == type and v['default']:
                 msg = _("Multiple default providers "
                         "for service %s") % type
-                LOG.error(msg)
+                LOG.exception(msg)
                 raise n_exc.Invalid(msg)
 
     def add_provider(self, provider):
@@ -246,7 +130,7 @@ class ProviderConfiguration(object):
         if provider_type in self.providers:
             msg = (_("Multiple providers specified for service "
                      "%s") % provider['service_type'])
-            LOG.error(msg)
+            LOG.exception(msg)
             raise n_exc.Invalid(msg)
         self.providers[provider_type] = {'driver': provider['driver'],
                                          'default': provider['default']}
@@ -266,11 +150,17 @@ class ProviderConfiguration(object):
                     return False
         return True
 
+    def _fields(self, resource, fields):
+        if fields:
+            return dict(((key, item) for key, item in resource.items()
+                         if key in fields))
+        return resource
+
     def get_service_providers(self, filters=None, fields=None):
-        return [db_utils.resource_fields({'service_type': k[0],
-                                          'name': k[1],
-                                          'driver': v['driver'],
-                                          'default': v['default']},
-                                         fields)
+        return [self._fields({'service_type': k[0],
+                              'name': k[1],
+                              'driver': v['driver'],
+                              'default': v['default']},
+                             fields)
                 for k, v in self.providers.items()
                 if self._check_entry(k, v, filters)]

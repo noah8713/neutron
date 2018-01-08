@@ -21,7 +21,7 @@ import sqlalchemy as sa
 
 
 net_binding_type = sa.Enum('flat', 'vlan', 'stt', 'gre', 'l3_ext',
-                           name='tz_network_bindings_binding_type')
+                           name='nvp_network_bindings_binding_type')
 l2gw_segmentation_type = sa.Enum('flat', 'vlan',
                                  name='networkconnections_segmentation_type')
 qos_marking = sa.Enum('untrusted', 'trusted', name='qosqueues_qos_marking')
@@ -29,7 +29,15 @@ qos_marking = sa.Enum('untrusted', 'trusted', name='qosqueues_qos_marking')
 
 def upgrade():
     op.create_table(
-        'tz_network_bindings',
+        'quantum_nvp_port_mapping',
+        sa.Column('quantum_id', sa.String(length=36), nullable=False),
+        sa.Column('nvp_id', sa.String(length=36), nullable=True),
+        sa.ForeignKeyConstraint(['quantum_id'], ['ports.id'],
+                                ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('quantum_id'))
+
+    op.create_table(
+        'nvp_network_bindings',
         sa.Column('network_id', sa.String(length=36), nullable=False),
         sa.Column('binding_type', net_binding_type, nullable=False),
         sa.Column('phy_uuid', sa.String(length=36), nullable=True),
@@ -40,11 +48,21 @@ def upgrade():
                                 'phy_uuid', 'vlan_id'))
 
     op.create_table(
-        'multi_provider_networks',
+        'nvp_multi_provider_networks',
         sa.Column('network_id', sa.String(length=36), nullable=False),
         sa.ForeignKeyConstraint(['network_id'], ['networks.id'],
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('network_id'))
+
+    op.create_table(
+        'nsxrouterextattributess',
+        sa.Column('router_id', sa.String(length=36), nullable=False),
+        sa.Column('distributed', sa.Boolean(), nullable=False),
+        sa.Column('service_router', sa.Boolean(), nullable=False,
+                  server_default='0'),
+        sa.ForeignKeyConstraint(['router_id'], ['routers.id'],
+                                ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('router_id'))
 
     op.create_table(
         'vcns_router_bindings',
@@ -56,6 +74,41 @@ def upgrade():
         sa.PrimaryKeyConstraint('router_id'))
 
     op.create_table(
+        'vcns_edge_pool_bindings',
+        sa.Column('pool_id', sa.String(length=36), nullable=False),
+        sa.Column('edge_id', sa.String(length=36), nullable=False),
+        sa.Column('pool_vseid', sa.String(length=36), nullable=True),
+        sa.ForeignKeyConstraint(['pool_id'], ['pools.id'],
+                                ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('pool_id', 'edge_id'))
+
+    op.create_table(
+        'vcns_edge_monitor_bindings',
+        sa.Column('monitor_id', sa.String(length=36), nullable=False),
+        sa.Column('edge_id', sa.String(length=36), nullable=False),
+        sa.Column('monitor_vseid', sa.String(length=36), nullable=True),
+        sa.ForeignKeyConstraint(['monitor_id'], ['healthmonitors.id'],
+                                ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('monitor_id', 'edge_id'))
+
+    op.create_table(
+        'vcns_firewall_rule_bindings',
+        sa.Column('rule_id', sa.String(length=36), nullable=False),
+        sa.Column('edge_id', sa.String(length=36), nullable=False),
+        sa.Column('rule_vseid', sa.String(length=36), nullable=True),
+        sa.ForeignKeyConstraint(['rule_id'], ['firewall_rules.id'], ),
+        sa.PrimaryKeyConstraint('rule_id', 'edge_id'))
+
+    op.create_table(
+        'vcns_edge_vip_bindings',
+        sa.Column('vip_id', sa.String(length=36), nullable=False),
+        sa.Column('edge_id', sa.String(length=36), nullable=True),
+        sa.Column('vip_vseid', sa.String(length=36), nullable=True),
+        sa.Column('app_profileid', sa.String(length=36), nullable=True),
+        sa.ForeignKeyConstraint(['vip_id'], ['vips.id'], ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('vip_id'))
+
+    op.create_table(
         'networkgateways',
         sa.Column('id', sa.String(length=36), nullable=False),
         sa.Column('name', sa.String(length=255), nullable=True),
@@ -64,9 +117,18 @@ def upgrade():
         sa.PrimaryKeyConstraint('id'))
 
     op.create_table(
+        'networkgatewaydevices',
+        sa.Column('id', sa.String(length=36), nullable=False),
+        sa.Column('network_gateway_id', sa.String(length=36), nullable=True),
+        sa.Column('interface_name', sa.String(length=64), nullable=True),
+        sa.ForeignKeyConstraint(['network_gateway_id'],
+                                ['networkgateways.id'],
+                                ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('id'))
+
+    op.create_table(
         'networkconnections',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True,
-                  index=True),
+        sa.Column('tenant_id', sa.String(length=255), nullable=True),
         sa.Column('network_gateway_id', sa.String(length=36), nullable=True),
         sa.Column('network_id', sa.String(length=36), nullable=True),
         sa.Column('segmentation_type', l2gw_segmentation_type, nullable=True),
@@ -83,12 +145,10 @@ def upgrade():
 
     op.create_table(
         'qosqueues',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True,
-                  index=True),
+        sa.Column('tenant_id', sa.String(length=255), nullable=True),
         sa.Column('id', sa.String(length=36), nullable=False),
         sa.Column('name', sa.String(length=255), nullable=True),
-        sa.Column('default', sa.Boolean(), nullable=True,
-                  server_default=sa.sql.false()),
+        sa.Column('default', sa.Boolean(), nullable=True),
         sa.Column('min', sa.Integer(), nullable=False),
         sa.Column('max', sa.Integer(), nullable=True),
         sa.Column('qos_marking', qos_marking, nullable=True),
@@ -122,83 +182,24 @@ def upgrade():
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('port_id'))
 
-    op.create_table('neutron_nsx_port_mappings',
-                    sa.Column('neutron_id', sa.String(length=36),
-                              nullable=False),
-                    sa.Column('nsx_port_id', sa.String(length=36),
-                              nullable=False),
-                    sa.Column('nsx_switch_id', sa.String(length=36),
-                              nullable=True),
-                    sa.ForeignKeyConstraint(['neutron_id'], ['ports.id'],
-                                            ondelete='CASCADE'),
-                    sa.PrimaryKeyConstraint('neutron_id'))
 
-    op.create_table(
-        'lsn',
-        sa.Column('net_id',
-                  sa.String(length=36), nullable=False),
-        sa.Column('lsn_id',
-                  sa.String(length=36), nullable=False),
-        sa.PrimaryKeyConstraint('lsn_id'))
-
-    op.create_table(
-        'lsn_port',
-        sa.Column('lsn_port_id',
-                  sa.String(length=36), nullable=False),
-        sa.Column('lsn_id',
-                  sa.String(length=36), nullable=False),
-        sa.Column('sub_id',
-                  sa.String(length=36), nullable=False, unique=True),
-        sa.Column('mac_addr',
-                  sa.String(length=32), nullable=False, unique=True),
-        sa.ForeignKeyConstraint(['lsn_id'], ['lsn.lsn_id'],
-                                ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('lsn_port_id'))
-
-    op.create_table(
-        'neutron_nsx_network_mappings',
-        sa.Column('neutron_id', sa.String(length=36), nullable=False),
-        sa.Column('nsx_id', sa.String(length=36), nullable=True),
-        sa.ForeignKeyConstraint(['neutron_id'], ['networks.id'],
-                                ondelete='CASCADE'),
-        # There might be multiple switches for a neutron network
-        sa.PrimaryKeyConstraint('neutron_id', 'nsx_id'),
-    )
-
-    op.create_table(
-        'neutron_nsx_router_mappings',
-        sa.Column('neutron_id', sa.String(length=36), nullable=False),
-        sa.Column('nsx_id', sa.String(length=36), nullable=True),
-        sa.ForeignKeyConstraint(['neutron_id'], ['routers.id'],
-                                ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('neutron_id'),
-    )
-
-    op.create_table(
-        'neutron_nsx_security_group_mappings',
-        sa.Column('neutron_id', sa.String(length=36), nullable=False),
-        sa.Column('nsx_id', sa.String(length=36), nullable=False),
-        sa.ForeignKeyConstraint(['neutron_id'], ['securitygroups.id'],
-                                ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('neutron_id', 'nsx_id'))
-
-    op.create_table(
-        'networkgatewaydevicereferences',
-        sa.Column('id', sa.String(length=36), nullable=False),
-        sa.Column('network_gateway_id', sa.String(length=36), nullable=True),
-        sa.Column('interface_name', sa.String(length=64), nullable=True),
-        sa.ForeignKeyConstraint(['network_gateway_id'], ['networkgateways.id'],
-                                ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('id', 'network_gateway_id', 'interface_name'))
-
-    op.create_table(
-        'networkgatewaydevices',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True,
-                  index=True),
-        sa.Column('id', sa.String(length=36), nullable=False),
-        sa.Column('nsx_id', sa.String(length=36), nullable=True),
-        sa.Column('name', sa.String(length=255), nullable=True),
-        sa.Column('connector_type', sa.String(length=10), nullable=True),
-        sa.Column('connector_ip', sa.String(length=64), nullable=True),
-        sa.Column('status', sa.String(length=16), nullable=True),
-        sa.PrimaryKeyConstraint('id'))
+def downgrade():
+    op.drop_table('maclearningstates')
+    op.drop_table('portqueuemappings')
+    op.drop_table('networkqueuemappings')
+    op.drop_table('qosqueues')
+    op.drop_table('networkconnections')
+    op.drop_table('networkgatewaydevices')
+    op.drop_table('networkgateways')
+    op.drop_table('vcns_edge_vip_bindings')
+    op.drop_table('vcns_firewall_rule_bindings')
+    op.drop_table('vcns_edge_monitor_bindings')
+    op.drop_table('vcns_edge_pool_bindings')
+    op.drop_table('vcns_router_bindings')
+    op.drop_table('nsxrouterextattributess')
+    op.drop_table('nvp_multi_provider_networks')
+    op.drop_table('nvp_network_bindings')
+    op.drop_table('quantum_nvp_port_mapping')
+    l2gw_segmentation_type.drop(op.get_bind(), checkfirst=False)
+    qos_marking.drop(op.get_bind(), checkfirst=False)
+    net_binding_type.drop(op.get_bind(), checkfirst=False)

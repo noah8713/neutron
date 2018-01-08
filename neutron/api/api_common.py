@@ -13,72 +13,30 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import functools
+import urllib
 
-from neutron_lib.db import model_base
-from neutron_lib import exceptions
 from oslo_config import cfg
-import oslo_i18n
-from oslo_log import log as logging
-from oslo_serialization import jsonutils
-from six.moves.urllib import parse
 from webob import exc
 
-from neutron._i18n import _
-from neutron.api import extensions
 from neutron.common import constants
-from neutron import wsgi
+from neutron.common import exceptions
+from neutron.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
 
 
-def ensure_if_match_supported():
-    """Raises exception if 'if-match' revision matching unsupported."""
-    if 'revision-if-match' in (extensions.PluginAwareExtensionManager.
-                               get_instance().extensions):
-        return
-    msg = _("This server does not support constraining operations based on "
-            "revision numbers")
-    raise exceptions.BadRequest(resource='if-match', msg=msg)
-
-
-def check_request_for_revision_constraint(request):
-    """Parses, verifies, and returns a constraint from a request."""
-    revision_number = None
-    for e in getattr(request.if_match, 'etags', []):
-        if e.startswith('revision_number='):
-            if revision_number is not None:
-                msg = _("Multiple revision_number etags are not supported.")
-                raise exceptions.BadRequest(resource='if-match', msg=msg)
-            ensure_if_match_supported()
-            try:
-                revision_number = int(e.split('revision_number=')[1])
-            except ValueError:
-                msg = _("Revision number etag must be in the format of "
-                        "revision_number=<int>")
-                raise exceptions.BadRequest(resource='if-match', msg=msg)
-    return revision_number
-
-
-def get_filters(request, attr_info, skips=None):
-    return get_filters_from_dict(request.GET.dict_of_lists(),
-                                 attr_info,
-                                 skips)
-
-
-def get_filters_from_dict(data, attr_info, skips=None):
-    """Extracts the filters from a dict of query parameters.
+def get_filters(request, attr_info, skips=[]):
+    """Extracts the filters from the request string.
 
     Returns a dict of lists for the filters:
     check=a&check=b&name=Bob&
     becomes:
     {'check': [u'a', u'b'], 'name': [u'Bob']}
     """
-    skips = skips or []
     res = {}
-    for key, values in data.items():
-        if key in skips or hasattr(model_base.BASEV2, key):
+    for key, values in request.GET.dict_of_lists().iteritems():
+        if key in skips:
             continue
         values = [v for v in values if v]
         key_attr_info = attr_info.get(key, {})
@@ -99,7 +57,7 @@ def get_previous_link(request, items, id_key):
         marker = items[0][id_key]
         params['marker'] = marker
     params['page_reverse'] = True
-    return "%s?%s" % (prepare_url(request.path_url), parse.urlencode(params))
+    return "%s?%s" % (request.path_url, urllib.urlencode(params))
 
 
 def get_next_link(request, items, id_key):
@@ -109,20 +67,7 @@ def get_next_link(request, items, id_key):
         marker = items[-1][id_key]
         params['marker'] = marker
     params.pop('page_reverse', None)
-    return "%s?%s" % (prepare_url(request.path_url), parse.urlencode(params))
-
-
-def prepare_url(orig_url):
-    """Takes a link and swaps in network_link_prefix if set."""
-    prefix = cfg.CONF.network_link_prefix
-    # Copied directly from nova/api/openstack/common.py
-    if not prefix:
-        return orig_url
-    url_parts = list(parse.urlsplit(orig_url))
-    prefix_parts = list(parse.urlsplit(prefix))
-    url_parts[0:2] = prefix_parts[0:2]
-    url_parts[2] = prefix_parts[2] + url_parts[2]
-    return parse.urlunsplit(url_parts).rstrip('/')
+    return "%s?%s" % (request.path_url, urllib.urlencode(params))
 
 
 def get_limit_and_marker(request):
@@ -135,7 +80,7 @@ def get_limit_and_marker(request):
                     pagination, then return None.
     """
     max_limit = _get_pagination_max_limit()
-    limit = _get_limit_param(request)
+    limit = _get_limit_param(request, max_limit)
     if max_limit > 0:
         limit = min(max_limit, limit) or max_limit
     if not limit:
@@ -153,22 +98,21 @@ def _get_pagination_max_limit():
             if max_limit == 0:
                 raise ValueError()
         except ValueError:
-            LOG.warning("Invalid value for pagination_max_limit: %s. It "
-                        "should be an integer greater to 0",
-                        cfg.CONF.pagination_max_limit)
+            LOG.warn(_("Invalid value for pagination_max_limit: %s. It "
+                       "should be an integer greater to 0"),
+                     cfg.CONF.pagination_max_limit)
     return max_limit
 
 
-def _get_limit_param(request):
+def _get_limit_param(request, max_limit):
     """Extract integer limit from request or fail."""
-    limit = request.GET.get('limit', 0)
     try:
-        limit = int(limit)
+        limit = int(request.GET.get('limit', 0))
         if limit >= 0:
             return limit
     except ValueError:
         pass
-    msg = _("Limit must be an integer 0 or greater and not '%s'") % limit
+    msg = _("Limit must be an integer 0 or greater and not '%d'")
     raise exceptions.BadRequest(resource='limit', msg=msg)
 
 
@@ -200,8 +144,8 @@ def get_sorts(request, attr_info):
                 'asc': constants.SORT_DIRECTION_ASC,
                 'desc': constants.SORT_DIRECTION_DESC})
         raise exc.HTTPBadRequest(explanation=msg)
-    return list(zip(sort_keys,
-                    [x == constants.SORT_DIRECTION_ASC for x in sort_dirs]))
+    return zip(sort_keys,
+               [x == constants.SORT_DIRECTION_ASC for x in sort_dirs])
 
 
 def get_page_reverse(request):
@@ -224,18 +168,6 @@ def get_pagination_links(request, items, limit,
                       "href": get_previous_link(request, items,
                                                 key)})
     return links
-
-
-def is_native_pagination_supported(plugin):
-    native_pagination_attr_name = ("_%s__native_pagination_support"
-                                   % plugin.__class__.__name__)
-    return getattr(plugin, native_pagination_attr_name, False)
-
-
-def is_native_sorting_supported(plugin):
-    native_sorting_attr_name = ("_%s__native_sorting_support"
-                                % plugin.__class__.__name__)
-    return getattr(plugin, native_sorting_attr_name, False)
 
 
 class PaginationHelper(object):
@@ -274,31 +206,15 @@ class PaginationEmulatedHelper(PaginationHelper):
     def paginate(self, items):
         if not self.limit:
             return items
-
-        if not items:
-            return []
-
-        # first, calculate the base index for pagination
+        i = -1
         if self.marker:
-            i = 0
             for item in items:
+                i = i + 1
                 if item[self.primary_key] == self.marker:
                     break
-                i += 1
-            else:
-                # if marker is not found, return nothing
-                return []
-        else:
-            i = len(items) if self.page_reverse else 0
-
         if self.page_reverse:
-            # don't wrap
-            return items[max(i - self.limit, 0):i]
-        else:
-            if self.marker:
-                # skip the matched marker
-                i += 1
-            return items[i:i + self.limit]
+            return items[i - self.limit:i]
+        return items[i + 1:i + self.limit + 1]
 
     def get_links(self, items):
         return get_pagination_links(
@@ -354,21 +270,11 @@ class SortingEmulatedHelper(SortingHelper):
     def sort(self, items):
         def cmp_func(obj1, obj2):
             for key, direction in self.sort_dict:
-                o1 = obj1[key]
-                o2 = obj2[key]
-
-                if o1 is None and o2 is None:
-                    ret = 0
-                elif o1 is None and o2 is not None:
-                    ret = -1
-                elif o1 is not None and o2 is None:
-                    ret = 1
-                else:
-                    ret = (o1 > o2) - (o1 < o2)
+                ret = cmp(obj1[key], obj2[key])
                 if ret:
                     return ret * (1 if direction else -1)
             return 0
-        return sorted(items, key=functools.cmp_to_key(cmp_func))
+        return sorted(items, cmp=cmp_func)
 
 
 class SortingNativeHelper(SortingHelper):
@@ -384,112 +290,38 @@ class NoSortingHelper(SortingHelper):
     pass
 
 
-def convert_exception_to_http_exc(e, faults, language):
-    serializer = wsgi.JSONDictSerializer()
-    if isinstance(e, exceptions.MultipleExceptions):
-        converted_exceptions = [
-            convert_exception_to_http_exc(inner, faults, language)
-            for inner in e.inner_exceptions]
-        # if no internal exceptions, will be handled as single exception
-        if converted_exceptions:
-            codes = {c.code for c in converted_exceptions}
-            if len(codes) == 1:
-                # all error codes are the same so we can maintain the code
-                # and just concatenate the bodies
-                joined_msg = "\n".join(
-                    (jsonutils.loads(c.body)['NeutronError']['message']
-                     for c in converted_exceptions))
-                new_body = jsonutils.loads(converted_exceptions[0].body)
-                new_body['NeutronError']['message'] = joined_msg
-                converted_exceptions[0].body = serializer.serialize(new_body)
-                return converted_exceptions[0]
-            else:
-                # multiple error types so we turn it into a Conflict with the
-                # inner codes and bodies packed in
-                new_exception = exceptions.Conflict()
-                inner_error_strings = []
-                for c in converted_exceptions:
-                    c_body = jsonutils.loads(c.body)
-                    err = ('HTTP %s %s: %s' % (
-                           c.code, c_body['NeutronError']['type'],
-                           c_body['NeutronError']['message']))
-                    inner_error_strings.append(err)
-                new_exception.msg = "\n".join(inner_error_strings)
-                return convert_exception_to_http_exc(
-                    new_exception, faults, language)
+class NeutronController(object):
+    """Base controller class for Neutron API."""
+    # _resource_name will be redefined in sub concrete controller
+    _resource_name = None
 
-    e = translate(e, language)
-    body = serializer.serialize(
-        {'NeutronError': get_exception_data(e)})
-    kwargs = {'body': body, 'content_type': 'application/json'}
-    if isinstance(e, exc.HTTPException):
-        # already an HTTP error, just update with content type and body
-        e.body = body
-        e.content_type = kwargs['content_type']
-        return e
-    faults_tuple = tuple(faults.keys()) + (exceptions.NeutronException,)
-    if isinstance(e, faults_tuple):
-        for fault in faults:
-            if isinstance(e, fault):
-                mapped_exc = faults[fault]
-                break
-        else:
-            mapped_exc = exc.HTTPInternalServerError
-        return mapped_exc(**kwargs)
-    if isinstance(e, NotImplementedError):
-        # NOTE(armando-migliaccio): from a client standpoint
-        # it makes sense to receive these errors, because
-        # extensions may or may not be implemented by
-        # the underlying plugin. So if something goes south,
-        # because a plugin does not implement a feature,
-        # returning 500 is definitely confusing.
-        kwargs['body'] = serializer.serialize(
-            {'NotImplementedError': get_exception_data(e)})
-        return exc.HTTPNotImplemented(**kwargs)
-    # NOTE(jkoelker) Everything else is 500
-    # Do not expose details of 500 error to clients.
-    msg = _('Request Failed: internal server error while '
-            'processing your request.')
-    msg = translate(msg, language)
-    kwargs['body'] = serializer.serialize(
-        {'NeutronError': get_exception_data(exc.HTTPInternalServerError(msg))})
-    return exc.HTTPInternalServerError(**kwargs)
+    def __init__(self, plugin):
+        self._plugin = plugin
+        super(NeutronController, self).__init__()
 
+    def _prepare_request_body(self, body, params):
+        """Verifies required parameters are in request body.
 
-def get_exception_data(e):
-    """Extract the information about an exception.
-
-    Neutron client for the v2 API expects exceptions to have 'type', 'message'
-    and 'detail' attributes.This information is extracted and converted into a
-    dictionary.
-
-    :param e: the exception to be reraised
-    :returns: a structured dict with the exception data
-    """
-    err_data = {'type': e.__class__.__name__,
-                'message': e, 'detail': ''}
-    return err_data
-
-
-def translate(translatable, locale):
-    """Translates the object to the given locale.
-
-    If the object is an exception its translatable elements are translated
-    in place, if the object is a translatable string it is translated and
-    returned. Otherwise, the object is returned as-is.
-
-    :param translatable: the object to be translated
-    :param locale: the locale to translate to
-    :returns: the translated object, or the object as-is if it
-              was not translated
-    """
-    localize = oslo_i18n.translate
-    if isinstance(translatable, exceptions.NeutronException):
-        translatable.msg = localize(translatable.msg, locale)
-    elif isinstance(translatable, exc.HTTPError):
-        translatable.detail = localize(translatable.detail, locale)
-    elif isinstance(translatable, Exception):
-        translatable.message = localize(translatable, locale)
-    else:
-        return localize(translatable, locale)
-    return translatable
+        Sets default value for missing optional parameters.
+        Body argument must be the deserialized body.
+        """
+        try:
+            if body is None:
+                # Initialize empty resource for setting default value
+                body = {self._resource_name: {}}
+            data = body[self._resource_name]
+        except KeyError:
+            # raise if _resource_name is not in req body.
+            raise exc.HTTPBadRequest(_("Unable to find '%s' in request body") %
+                                     self._resource_name)
+        for param in params:
+            param_name = param['param-name']
+            param_value = data.get(param_name)
+            # If the parameter wasn't found and it was required, return 400
+            if param_value is None and param['required']:
+                msg = (_("Failed to parse request. "
+                         "Parameter '%s' not specified") % param_name)
+                LOG.error(msg)
+                raise exc.HTTPBadRequest(msg)
+            data[param_name] = param_value or param.get('default-value')
+        return body

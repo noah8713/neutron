@@ -13,17 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib import constants as p_const
-from neutron_lib import exceptions as exc
-from neutron_lib.plugins.ml2 import api
-from oslo_log import log
-
-from neutron._i18n import _
+from neutron.common import exceptions as exc
+from neutron.openstack.common import log
+from neutron.plugins.common import constants as p_const
+from neutron.plugins.ml2 import driver_api as api
 
 LOG = log.getLogger(__name__)
 
 
-class LocalTypeDriver(api.ML2TypeDriver):
+class LocalTypeDriver(api.TypeDriver):
     """Manage state for local networks with ML2.
 
     The LocalTypeDriver implements the 'local' network_type. Local
@@ -34,7 +32,7 @@ class LocalTypeDriver(api.ML2TypeDriver):
     """
 
     def __init__(self):
-        LOG.info("ML2 LocalTypeDriver initialization complete")
+        LOG.info(_("ML2 LocalTypeDriver initialization complete"))
 
     def get_type(self):
         return p_const.TYPE_LOCAL
@@ -46,22 +44,19 @@ class LocalTypeDriver(api.ML2TypeDriver):
         return False
 
     def validate_provider_segment(self, segment):
-        for key, value in segment.items():
+        for key, value in segment.iteritems():
             if value and key != api.NETWORK_TYPE:
                 msg = _("%s prohibited for local provider network") % key
                 raise exc.InvalidInput(error_message=msg)
 
-    def reserve_provider_segment(self, context, segment):
+    def reserve_provider_segment(self, session, segment):
         # No resources to reserve
         return segment
 
-    def allocate_tenant_segment(self, context):
+    def allocate_tenant_segment(self, session):
         # No resources to allocate
         return {api.NETWORK_TYPE: p_const.TYPE_LOCAL}
 
-    def release_segment(self, context, segment):
+    def release_segment(self, session, segment):
         # No resources to release
-        pass
-
-    def get_mtu(self, physical_network=None):
         pass

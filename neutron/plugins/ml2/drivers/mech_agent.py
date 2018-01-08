@@ -14,15 +14,11 @@
 #    under the License.
 
 import abc
-
-from neutron_lib.api.definitions import portbindings
-from neutron_lib.callbacks import resources
-from neutron_lib import constants as const
-from neutron_lib.plugins.ml2 import api
-from oslo_log import log
 import six
 
-from neutron.db import provisioning_blocks
+from neutron.extensions import portbindings
+from neutron.openstack.common import log
+from neutron.plugins.ml2 import driver_api as api
 
 LOG = log.getLogger(__name__)
 
@@ -54,63 +50,28 @@ class AgentMechanismDriverBase(api.MechanismDriver):
     def initialize(self):
         pass
 
-    def create_port_precommit(self, context):
-        self._insert_provisioning_block(context)
-
-    def update_port_precommit(self, context):
-        if context.host == context.original_host:
-            return
-        self._insert_provisioning_block(context)
-
-    def _insert_provisioning_block(self, context):
-        # we insert a status barrier to prevent the port from transitioning
-        # to active until the agent reports back that the wiring is done
-        port = context.current
-        if not context.host or port['status'] == const.PORT_STATUS_ACTIVE:
-            # no point in putting in a block if the status is already ACTIVE
-            return
-        vnic_type = context.current.get(portbindings.VNIC_TYPE,
-                                        portbindings.VNIC_NORMAL)
-        if vnic_type not in self.supported_vnic_types:
-            # we check the VNIC type because there could be multiple agents
-            # on a single host with different VNIC types
-            return
-        if context.host_agents(self.agent_type):
-            provisioning_blocks.add_provisioning_component(
-                context._plugin_context, port['id'], resources.PORT,
-                provisioning_blocks.L2_AGENT_ENTITY)
-
     def bind_port(self, context):
-        LOG.debug("Attempting to bind port %(port)s on "
-                  "network %(network)s",
+        LOG.debug(_("Attempting to bind port %(port)s on "
+                    "network %(network)s"),
                   {'port': context.current['id'],
                    'network': context.network.current['id']})
         vnic_type = context.current.get(portbindings.VNIC_TYPE,
                                         portbindings.VNIC_NORMAL)
         if vnic_type not in self.supported_vnic_types:
-            LOG.debug("Refusing to bind due to unsupported vnic_type: %s",
+            LOG.debug(_("Refusing to bind due to unsupported vnic_type: %s"),
                       vnic_type)
             return
-        agents = context.host_agents(self.agent_type)
-        if not agents:
-            LOG.debug("Port %(pid)s on network %(network)s not bound, "
-                      "no agent of type %(at)s registered on host %(host)s",
-                      {'pid': context.current['id'],
-                       'at': self.agent_type,
-                       'network': context.network.current['id'],
-                       'host': context.host})
-        for agent in agents:
-            LOG.debug("Checking agent: %s", agent)
+        for agent in context.host_agents(self.agent_type):
+            LOG.debug(_("Checking agent: %s"), agent)
             if agent['alive']:
-                for segment in context.segments_to_bind:
+                for segment in context.network.network_segments:
                     if self.try_to_bind_segment_for_agent(context, segment,
                                                           agent):
-                        LOG.debug("Bound using segment: %s", segment)
+                        LOG.debug(_("Bound using segment: %s"), segment)
                         return
             else:
-                LOG.warning("Refusing to bind port %(pid)s to dead agent: "
-                            "%(agent)s",
-                            {'pid': context.current['id'], 'agent': agent})
+                LOG.warning(_("Attempting to bind with dead agent: %s"),
+                            agent)
 
     @abc.abstractmethod
     def try_to_bind_segment_for_agent(self, context, segment, agent):
@@ -167,51 +128,13 @@ class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase):
     def try_to_bind_segment_for_agent(self, context, segment, agent):
         if self.check_segment_for_agent(segment, agent):
             context.set_binding(segment[api.ID],
-                                self.get_vif_type(context, agent, segment),
-                                self.get_vif_details(context, agent, segment))
+                                self.vif_type,
+                                self.vif_details)
             return True
         else:
             return False
 
-    def get_vif_details(self, context, agent, segment):
-        return self.vif_details
-
-    def get_vif_type(self, context, agent, segment):
-        """Return the vif type appropriate for the agent and segment."""
-        return self.vif_type
-
     @abc.abstractmethod
-    def get_allowed_network_types(self, agent=None):
-        """Return the agent's or driver's allowed network types.
-
-        For example: return ('flat', ...). You can also refer to the
-        configuration the given agent exposes.
-        """
-        pass
-
-    @abc.abstractmethod
-    def get_mappings(self, agent):
-        """Return the agent's bridge or interface mappings.
-
-        For example: agent['configurations'].get('bridge_mappings', {}).
-        """
-        pass
-
-    def physnet_in_mappings(self, physnet, mappings):
-        """Is the physical network part of the given mappings?"""
-        return physnet in mappings
-
-    def filter_hosts_with_segment_access(
-            self, context, segments, candidate_hosts, agent_getter):
-
-        hosts = set()
-        filters = {'host': candidate_hosts, 'agent_type': [self.agent_type]}
-        for agent in agent_getter(context, filters=filters):
-            if any(self.check_segment_for_agent(s, agent) for s in segments):
-                hosts.add(agent['host'])
-
-        return hosts
-
     def check_segment_for_agent(self, segment, agent):
         """Check if segment can be bound for agent.
 
@@ -225,43 +148,3 @@ class SimpleAgentMechanismDriverBase(AgentMechanismDriverBase):
         determine whether or not the specified network segment can be
         bound for the agent.
         """
-
-        mappings = self.get_mappings(agent)
-        allowed_network_types = self.get_allowed_network_types(agent)
-
-        LOG.debug("Checking segment: %(segment)s "
-                  "for mappings: %(mappings)s "
-                  "with network types: %(network_types)s",
-                  {'segment': segment, 'mappings': mappings,
-                   'network_types': allowed_network_types})
-
-        network_type = segment[api.NETWORK_TYPE]
-        if network_type not in allowed_network_types:
-            LOG.debug(
-                'Network %(network_id)s with segment %(id)s is type '
-                'of %(network_type)s but agent %(agent)s or mechanism driver '
-                'only support %(allowed_network_types)s.',
-                {'network_id': segment['network_id'],
-                 'id': segment['id'],
-                 'network_type': network_type,
-                 'agent': agent['host'],
-                 'allowed_network_types': allowed_network_types})
-            return False
-
-        if network_type in [const.TYPE_FLAT, const.TYPE_VLAN]:
-            physnet = segment[api.PHYSICAL_NETWORK]
-            if not self.physnet_in_mappings(physnet, mappings):
-                LOG.debug(
-                    'Network %(network_id)s with segment %(id)s is connected '
-                    'to physical network %(physnet)s, but agent %(agent)s '
-                    'reported physical networks %(mappings)s. '
-                    'The physical network must be configured on the '
-                    'agent if binding is to succeed.',
-                    {'network_id': segment['network_id'],
-                     'id': segment['id'],
-                     'physnet': physnet,
-                     'agent': agent['host'],
-                     'mappings': mappings})
-                return False
-
-        return True

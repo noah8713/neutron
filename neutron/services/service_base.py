@@ -13,14 +13,46 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_log import log as logging
-from oslo_utils import excutils
-from oslo_utils import importutils
+import abc
 
+import six
+
+from neutron.api import extensions
 from neutron.db import servicetype_db as sdb
+from neutron.openstack.common import excutils
+from neutron.openstack.common import importutils
+from neutron.openstack.common import log as logging
 from neutron.services import provider_configuration as pconf
 
 LOG = logging.getLogger(__name__)
+
+
+@six.add_metaclass(abc.ABCMeta)
+class ServicePluginBase(extensions.PluginInterface):
+    """Define base interface for any Advanced Service plugin."""
+    supported_extension_aliases = []
+
+    @abc.abstractmethod
+    def get_plugin_type(self):
+        """Return one of predefined service types.
+
+        See neutron/plugins/common/constants.py
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_plugin_name(self):
+        """Return a symbolic name for the plugin.
+
+        Each service plugin should have a symbolic name. This name
+        will be used, for instance, by service definitions in service types
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_plugin_description(self):
+        """Return string description of the plugin."""
+        pass
 
 
 def load_drivers(service_type, plugin):
@@ -35,7 +67,7 @@ def load_drivers(service_type, plugin):
                      filters={'service_type': [service_type]})
                  )
     if not providers:
-        msg = ("No providers specified for '%s' service, exiting" %
+        msg = (_("No providers specified for '%s' service, exiting") %
                service_type)
         LOG.error(msg)
         raise SystemExit(1)
@@ -46,14 +78,14 @@ def load_drivers(service_type, plugin):
             drivers[provider['name']] = importutils.import_object(
                 provider['driver'], plugin
             )
-            LOG.debug("Loaded '%(provider)s' provider for service "
-                      "%(service_type)s",
+            LOG.debug(_("Loaded '%(provider)s' provider for service "
+                        "%(service_type)s"),
                       {'provider': provider['driver'],
                        'service_type': service_type})
         except ImportError:
             with excutils.save_and_reraise_exception():
-                LOG.exception("Error loading provider '%(provider)s' for "
-                              "service %(service_type)s",
+                LOG.exception(_("Error loading provider '%(provider)s' for "
+                                "service %(service_type)s"),
                               {'provider': provider['driver'],
                                'service_type': service_type})
 
@@ -63,7 +95,7 @@ def load_drivers(service_type, plugin):
             None, service_type)
         default_provider = provider['name']
     except pconf.DefaultServiceProviderNotFound:
-        LOG.info("Default provider is not specified for service type %s",
+        LOG.info(_("Default provider is not specified for service type %s"),
                  service_type)
 
     return drivers, default_provider

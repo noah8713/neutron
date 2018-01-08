@@ -13,51 +13,46 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
-
-from oslo_log import log as logging
-import oslo_messaging
-
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
+from neutron.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
 
 
-PortInfo = collections.namedtuple("PortInfo", "mac_address ip_address")
-
-
-class L2populationAgentNotifyAPI(object):
+class L2populationAgentNotifyAPI(n_rpc.RpcProxy):
+    BASE_RPC_API_VERSION = '1.0'
 
     def __init__(self, topic=topics.AGENT):
-        self.topic = topic
+        super(L2populationAgentNotifyAPI, self).__init__(
+            topic=topic, default_version=self.BASE_RPC_API_VERSION)
+
         self.topic_l2pop_update = topics.get_topic_name(topic,
                                                         topics.L2POPULATION,
                                                         topics.UPDATE)
-        target = oslo_messaging.Target(topic=topic, version='1.0')
-        self.client = n_rpc.get_client(target)
 
     def _notification_fanout(self, context, method, fdb_entries):
-        LOG.debug('Fanout notify l2population agents at %(topic)s '
-                  'the message %(method)s with %(fdb_entries)s',
+        LOG.debug(_('Fanout notify l2population agents at %(topic)s '
+                    'the message %(method)s with %(fdb_entries)s'),
                   {'topic': self.topic,
                    'method': method,
                    'fdb_entries': fdb_entries})
 
-        cctxt = self.client.prepare(topic=self.topic_l2pop_update, fanout=True)
-        cctxt.cast(context, method, fdb_entries=fdb_entries)
+        self.fanout_cast(context,
+                         self.make_msg(method, fdb_entries=fdb_entries),
+                         topic=self.topic_l2pop_update)
 
     def _notification_host(self, context, method, fdb_entries, host):
-        LOG.debug('Notify l2population agent %(host)s at %(topic)s the '
-                  'message %(method)s with %(fdb_entries)s',
+        LOG.debug(_('Notify l2population agent %(host)s at %(topic)s the '
+                    'message %(method)s with %(fdb_entries)s'),
                   {'host': host,
                    'topic': self.topic,
                    'method': method,
                    'fdb_entries': fdb_entries})
-
-        cctxt = self.client.prepare(topic=self.topic_l2pop_update, server=host)
-        cctxt.cast(context, method, fdb_entries=fdb_entries)
+        self.cast(context,
+                  self.make_msg(method, fdb_entries=fdb_entries),
+                  topic='%s.%s' % (self.topic_l2pop_update, host))
 
     def add_fdb_entries(self, context, fdb_entries, host=None):
         if fdb_entries:

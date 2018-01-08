@@ -15,12 +15,10 @@
 
 import abc
 
-from neutron_lib.api import extensions as api_extensions
-from neutron_lib.plugins import directory
-
 from neutron.api import extensions
 from neutron.api.v2 import base
-from neutron.quota import resource_registry
+from neutron import manager
+from neutron import quota
 
 
 # Attribute Map
@@ -40,7 +38,7 @@ RESOURCE_ATTRIBUTE_MAP = {
 }
 
 
-class Extensionattribute(api_extensions.ExtensionDescriptor):
+class Extensionattribute(extensions.ExtensionDescriptor):
 
     @classmethod
     def get_name(cls):
@@ -55,6 +53,10 @@ class Extensionattribute(api_extensions.ExtensionDescriptor):
         return "Extension Test Resource"
 
     @classmethod
+    def get_namespace(cls):
+        return ""
+
+    @classmethod
     def get_updated(cls):
         return "2013-02-05T10:00:00-00:00"
 
@@ -66,12 +68,12 @@ class Extensionattribute(api_extensions.ExtensionDescriptor):
     def get_resources(cls):
         """Returns Ext Resources."""
         exts = []
-        plugin = directory.get_plugin()
+        plugin = manager.NeutronManager.get_plugin()
         resource_name = 'ext_test_resource'
         collection_name = resource_name + "s"
         params = RESOURCE_ATTRIBUTE_MAP.get(collection_name, dict())
 
-        resource_registry.register_resource_by_name(resource_name)
+        quota.QUOTAS.register_resource_by_name(resource_name)
 
         controller = base.create_resource(collection_name,
                                           resource_name,

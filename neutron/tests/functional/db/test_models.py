@@ -36,3 +36,7 @@ class TestDBCreation(base.BaseTestCase):
     def test_head_creation(self):
         from neutron.db.migration.models import head
         self._test_creation(head)
+
+    def test_frozen_creation(self):
+        from neutron.db.migration.models import frozen
+        self._test_creation(frozen)

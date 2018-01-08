@@ -14,6 +14,7 @@
 #
 
 # Initial operations for plugins:
+# hyper-v
 # bigswitch
 # metaplugin
 
@@ -23,6 +24,25 @@ import sqlalchemy as sa
 
 
 def upgrade():
+    # hyper-v
+    op.create_table(
+        'hyperv_vlan_allocations',
+        sa.Column('physical_network', sa.String(length=64), nullable=False),
+        sa.Column('vlan_id', sa.Integer(), autoincrement=False,
+                  nullable=False),
+        sa.Column('allocated', sa.Boolean(), nullable=False),
+        sa.PrimaryKeyConstraint('physical_network', 'vlan_id'))
+
+    op.create_table(
+        'hyperv_network_bindings',
+        sa.Column('network_id', sa.String(length=36), nullable=False),
+        sa.Column('network_type', sa.String(length=32), nullable=False),
+        sa.Column('physical_network', sa.String(length=64), nullable=True),
+        sa.Column('segmentation_id', sa.Integer(), nullable=True),
+        sa.ForeignKeyConstraint(['network_id'], ['networks.id'],
+                                ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('network_id'))
+
     # metaplugin
     op.create_table(
         'networkflavors',
@@ -60,8 +80,11 @@ def upgrade():
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('rule_id', 'nexthop'))
 
-    op.create_table(
-        'consistencyhashes',
-        sa.Column('hash_id', sa.String(255), primary_key=True),
-        sa.Column('hash', sa.String(255), nullable=False)
-    )
+
+def downgrade():
+    op.drop_table('nexthops')
+    op.drop_table('routerrules')
+    op.drop_table('routerflavors')
+    op.drop_table('networkflavors')
+    op.drop_table('hyperv_network_bindings')
+    op.drop_table('hyperv_vlan_allocations')

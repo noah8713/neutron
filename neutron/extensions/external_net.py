@@ -13,9 +13,56 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api.definitions import external_net as extnet_apidef
-from neutron_lib.api import extensions
+from neutron.api import extensions
+from neutron.api.v2 import attributes as attr
+from neutron.common import exceptions as qexception
+from neutron.extensions import l3
 
 
-class External_net(extensions.APIExtensionDescriptor):
-    api_definition = extnet_apidef
+class ExternalNetworkInUse(qexception.InUse):
+    message = _("External network %(net_id)s cannot be updated to be made "
+                "non-external, since it has existing gateway ports")
+
+
+# For backward compatibility the 'router' prefix is kept.
+EXTERNAL = 'router:external'
+EXTENDED_ATTRIBUTES_2_0 = {
+    'networks': {EXTERNAL: {'allow_post': True,
+                            'allow_put': True,
+                            'default': False,
+                            'is_visible': True,
+                            'convert_to': attr.convert_to_boolean,
+                            'enforce_policy': True,
+                            'required_by_policy': True}}}
+
+
+class External_net(extensions.ExtensionDescriptor):
+
+    @classmethod
+    def get_name(cls):
+        return "Neutron external network"
+
+    @classmethod
+    def get_alias(cls):
+        return "external-net"
+
+    @classmethod
+    def get_description(cls):
+        return _("Adds external network attribute to network resource.")
+
+    @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/ext/neutron/external_net/api/v1.0"
+
+    @classmethod
+    def get_updated(cls):
+        return "2013-01-14T10:00:00-00:00"
+
+    def get_extended_resources(self, version):
+        if version == "2.0":
+            return EXTENDED_ATTRIBUTES_2_0
+        else:
+            return {}
+
+    def get_alias_namespace_compatibility_map(self):
+        return {l3.L3.get_alias(): l3.L3.get_namespace()}

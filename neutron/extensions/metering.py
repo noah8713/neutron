@@ -14,17 +14,96 @@
 
 import abc
 
-from neutron_lib.api.definitions import metering as metering_apidef
-from neutron_lib.api import extensions
-from neutron_lib.plugins import constants
-from neutron_lib.services import base as service_base
 import six
 
+from neutron.api import extensions
+from neutron.api.v2 import attributes as attr
 from neutron.api.v2 import resource_helper
+from neutron.common import exceptions as qexception
+from neutron.openstack.common import log as logging
+from neutron.plugins.common import constants
+from neutron.services import service_base
+
+LOG = logging.getLogger(__name__)
 
 
-class Metering(extensions.APIExtensionDescriptor):
-    api_definition = metering_apidef
+class MeteringLabelNotFound(qexception.NotFound):
+    message = _("Metering label %(label_id)s does not exist")
+
+
+class DuplicateMeteringRuleInPost(qexception.InUse):
+    message = _("Duplicate Metering Rule in POST.")
+
+
+class MeteringLabelRuleNotFound(qexception.NotFound):
+    message = _("Metering label rule %(rule_id)s does not exist")
+
+
+class MeteringLabelRuleOverlaps(qexception.NotFound):
+    message = _("Metering label rule with remote_ip_prefix "
+                "%(remote_ip_prefix)s overlaps another")
+
+
+RESOURCE_ATTRIBUTE_MAP = {
+    'metering_labels': {
+        'id': {'allow_post': False, 'allow_put': False,
+               'is_visible': True,
+               'primary_key': True},
+        'name': {'allow_post': True, 'allow_put': False,
+                 'is_visible': True, 'default': ''},
+        'description': {'allow_post': True, 'allow_put': False,
+                        'is_visible': True, 'default': ''},
+        'tenant_id': {'allow_post': True, 'allow_put': False,
+                      'required_by_policy': True,
+                      'is_visible': True},
+        'shared': {'allow_post': True, 'allow_put': False,
+                   'is_visible': True, 'default': False,
+                   'convert_to': attr.convert_to_boolean}
+    },
+    'metering_label_rules': {
+        'id': {'allow_post': False, 'allow_put': False,
+               'is_visible': True,
+               'primary_key': True},
+        'metering_label_id': {'allow_post': True, 'allow_put': False,
+                              'validate': {'type:uuid': None},
+                              'is_visible': True, 'required_by_policy': True},
+        'direction': {'allow_post': True, 'allow_put': False,
+                      'is_visible': True,
+                      'validate': {'type:values': ['ingress', 'egress']}},
+        'excluded': {'allow_post': True, 'allow_put': False,
+                     'is_visible': True, 'default': False,
+                     'convert_to': attr.convert_to_boolean},
+        'remote_ip_prefix': {'allow_post': True, 'allow_put': False,
+                             'is_visible': True, 'required_by_policy': True,
+                             'validate': {'type:subnet': None}},
+        'tenant_id': {'allow_post': True, 'allow_put': False,
+                      'required_by_policy': True,
+                      'is_visible': True}
+    }
+}
+
+
+class Metering(extensions.ExtensionDescriptor):
+
+    @classmethod
+    def get_name(cls):
+        return "Neutron Metering"
+
+    @classmethod
+    def get_alias(cls):
+        return "metering"
+
+    @classmethod
+    def get_description(cls):
+        return "Neutron Metering extension."
+
+    @classmethod
+    def get_namespace(cls):
+        return "http://wiki.openstack.org/wiki/Neutron/Metering/Bandwidth#API"
+
+    @classmethod
+    def get_updated(cls):
+        return "2013-06-12T10:00:00-00:00"
 
     @classmethod
     def get_plugin_interface(cls):
@@ -34,32 +113,43 @@ class Metering(extensions.APIExtensionDescriptor):
     def get_resources(cls):
         """Returns Ext Resources."""
         plural_mappings = resource_helper.build_plural_mappings(
-            {}, metering_apidef.RESOURCE_ATTRIBUTE_MAP)
+            {}, RESOURCE_ATTRIBUTE_MAP)
+        attr.PLURALS.update(plural_mappings)
         # PCM: Metering sets pagination and sorting to True. Do we have cfg
         # entries for these so can be read? Else, must pass in.
-        return resource_helper.build_resource_info(
-            plural_mappings, metering_apidef.RESOURCE_ATTRIBUTE_MAP,
-            constants.METERING, translate_name=True, allow_bulk=True)
+        return resource_helper.build_resource_info(plural_mappings,
+                                                   RESOURCE_ATTRIBUTE_MAP,
+                                                   constants.METERING,
+                                                   translate_name=True,
+                                                   allow_bulk=True)
+
+    def update_attributes_map(self, attributes):
+        super(Metering, self).update_attributes_map(
+            attributes, extension_attrs_map=RESOURCE_ATTRIBUTE_MAP)
+
+    def get_extended_resources(self, version):
+        if version == "2.0":
+            return RESOURCE_ATTRIBUTE_MAP
+        else:
+            return {}
 
 
 @six.add_metaclass(abc.ABCMeta)
 class MeteringPluginBase(service_base.ServicePluginBase):
 
+    def get_plugin_name(self):
+        return constants.METERING
+
     def get_plugin_description(self):
         return constants.METERING
 
-    @classmethod
-    def get_plugin_type(cls):
+    def get_plugin_type(self):
         return constants.METERING
 
     @abc.abstractmethod
     def create_metering_label(self, context, metering_label):
         """Create a metering label."""
         pass
-
-    def update_metering_label(self, context, id, metering_label):
-        """Update a metering label."""
-        raise NotImplementedError()
 
     @abc.abstractmethod
     def delete_metering_label(self, context, label_id):
@@ -82,10 +172,6 @@ class MeteringPluginBase(service_base.ServicePluginBase):
     def create_metering_label_rule(self, context, metering_label_rule):
         """Create a metering label rule."""
         pass
-
-    def update_metering_label_rule(self, context, id, metering_label_rule):
-        """Update a metering label rule."""
-        raise NotImplementedError()
 
     @abc.abstractmethod
     def get_metering_label_rule(self, context, rule_id, fields=None):

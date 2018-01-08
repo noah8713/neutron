@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.common import eventlet_utils
+from oslo_config import cfg
 
 
-eventlet_utils.monkey_patch()
+cfg.CONF.use_stderr = False

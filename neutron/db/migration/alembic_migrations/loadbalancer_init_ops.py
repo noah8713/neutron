@@ -42,6 +42,9 @@ def upgrade():
         sa.Column('url_path', sa.String(length=255), nullable=True),
         sa.Column('expected_codes', sa.String(length=64), nullable=True),
         sa.Column('admin_state_up', sa.Boolean(), nullable=False),
+        sa.Column('name', sa.String(255), nullable=False),
+        sa.Column('response_string', sa.String(8192), nullable=True),
+        sa.Column('shared', sa.Boolean(), nullable=False, default=True),
         sa.PrimaryKeyConstraint('id'))
 
     op.create_table(
@@ -108,13 +111,12 @@ def upgrade():
         sa.Column('weight', sa.Integer(), nullable=False),
         sa.Column('admin_state_up', sa.Boolean(), nullable=False),
         sa.ForeignKeyConstraint(['pool_id'], ['pools.id'], ),
-        sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint('pool_id', 'address', 'protocol_port',
-                            name='uniq_member0pool_id0address0port'))
+        sa.PrimaryKeyConstraint('id'))
 
     op.create_table(
         'poolmonitorassociations',
-        sa.Column('status', sa.String(length=16), nullable=False),
+        sa.Column('status', sa.String(length=16), nullable=False,
+                  server_default=''),
         sa.Column('status_description', sa.String(length=255), nullable=True),
         sa.Column('pool_id', sa.String(length=36), nullable=False),
         sa.Column('monitor_id', sa.String(length=36), nullable=False),
@@ -125,19 +127,24 @@ def upgrade():
     op.create_table(
         'poolstatisticss',
         sa.Column('pool_id', sa.String(length=36), nullable=False),
-        sa.Column('bytes_in', sa.BigInteger(), nullable=False),
-        sa.Column('bytes_out', sa.BigInteger(), nullable=False),
-        sa.Column('active_connections', sa.BigInteger(), nullable=False),
-        sa.Column('total_connections', sa.BigInteger(), nullable=False),
+        sa.Column('bytes_in', sa.Integer(), nullable=False),
+        sa.Column('bytes_out', sa.Integer(), nullable=False),
+        sa.Column('active_connections', sa.Integer(), nullable=False),
+        sa.Column('total_connections', sa.Integer(), nullable=False),
         sa.ForeignKeyConstraint(['pool_id'], ['pools.id'], ),
         sa.PrimaryKeyConstraint('pool_id'))
 
-    op.create_table(
-        u'embrane_pool_port',
-        sa.Column(u'pool_id', sa.String(length=36), nullable=False),
-        sa.Column(u'port_id', sa.String(length=36), nullable=False),
-        sa.ForeignKeyConstraint(['pool_id'], [u'pools.id'],
-                                name=u'embrane_pool_port_ibfk_1'),
-        sa.ForeignKeyConstraint(['port_id'], [u'ports.id'],
-                                name=u'embrane_pool_port_ibfk_2'),
-        sa.PrimaryKeyConstraint(u'pool_id'))
+
+def downgrade():
+    op.drop_table('poolstatisticss')
+    op.drop_table('poolmonitorassociations')
+    op.drop_table('members')
+    op.drop_table('poolloadbalanceragentbindings')
+    op.drop_table('sessionpersistences')
+    op.drop_table('pools')
+    op.drop_table('vips')
+    op.drop_table('healthmonitors')
+    protocols.drop(op.get_bind(), checkfirst=False)
+    session_persistence_type.drop(op.get_bind(), checkfirst=False)
+    lb_methods.drop(op.get_bind(), checkfirst=False)
+    health_monitor_type.drop(op.get_bind(), checkfirst=False)

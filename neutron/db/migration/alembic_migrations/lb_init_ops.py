@@ -36,3 +36,8 @@ def upgrade():
         sa.ForeignKeyConstraint(['network_id'], ['networks.id'],
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('network_id'))
+
+
+def downgrade():
+    op.drop_table('network_bindings')
+    op.drop_table('network_states')

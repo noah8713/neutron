@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api import extensions
+from neutron.api import extensions
 
 EXTENDED_ATTRIBUTE = 'extended_attribute'
 EXTENDED_ATTRIBUTES_2_0 = {
@@ -38,6 +38,10 @@ class Extendedattribute(extensions.ExtensionDescriptor):
     @classmethod
     def get_description(cls):
         return "Provides extended_attr attribute to router"
+
+    @classmethod
+    def get_namespace(cls):
+        return ""
 
     @classmethod
     def get_updated(cls):

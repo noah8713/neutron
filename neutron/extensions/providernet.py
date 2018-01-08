@@ -13,12 +13,34 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api.definitions import provider_net
-from neutron_lib.api import extensions
-from neutron_lib.api import validators
-from neutron_lib import exceptions as n_exc
+from neutron.api import extensions
+from neutron.api.v2 import attributes
+from neutron.common import exceptions as n_exc
 
-from neutron._i18n import _
+
+NETWORK_TYPE = 'provider:network_type'
+PHYSICAL_NETWORK = 'provider:physical_network'
+SEGMENTATION_ID = 'provider:segmentation_id'
+
+EXTENDED_ATTRIBUTES_2_0 = {
+    'networks': {
+        NETWORK_TYPE: {'allow_post': True, 'allow_put': True,
+                       'validate': {'type:string': None},
+                       'default': attributes.ATTR_NOT_SPECIFIED,
+                       'enforce_policy': True,
+                       'is_visible': True},
+        PHYSICAL_NETWORK: {'allow_post': True, 'allow_put': True,
+                           'validate': {'type:string': None},
+                           'default': attributes.ATTR_NOT_SPECIFIED,
+                           'enforce_policy': True,
+                           'is_visible': True},
+        SEGMENTATION_ID: {'allow_post': True, 'allow_put': True,
+                          'convert_to': attributes.convert_to_int,
+                          'enforce_policy': True,
+                          'default': attributes.ATTR_NOT_SPECIFIED,
+                          'is_visible': True},
+    }
+}
 
 
 def _raise_if_updates_provider_attributes(attrs):
@@ -27,13 +49,13 @@ def _raise_if_updates_provider_attributes(attrs):
     This method is used for plugins that do not support
     updating provider networks.
     """
-    if any(validators.is_attr_set(attrs.get(a))
-           for a in provider_net.ATTRIBUTES):
+    immutable = (NETWORK_TYPE, PHYSICAL_NETWORK, SEGMENTATION_ID)
+    if any(attributes.is_attr_set(attrs.get(a)) for a in immutable):
         msg = _("Plugin does not support updating provider attributes")
         raise n_exc.InvalidInput(error_message=msg)
 
 
-class Providernet(extensions.APIExtensionDescriptor):
+class Providernet(extensions.ExtensionDescriptor):
     """Extension class supporting provider networks.
 
     This class is used by neutron's extension framework to make
@@ -45,4 +67,29 @@ class Providernet(extensions.APIExtensionDescriptor):
     With admin rights, network dictionaries returned will also include
     provider attributes.
     """
-    api_definition = provider_net
+
+    @classmethod
+    def get_name(cls):
+        return "Provider Network"
+
+    @classmethod
+    def get_alias(cls):
+        return "provider"
+
+    @classmethod
+    def get_description(cls):
+        return "Expose mapping of virtual networks to physical networks"
+
+    @classmethod
+    def get_namespace(cls):
+        return "http://docs.openstack.org/ext/provider/api/v1.0"
+
+    @classmethod
+    def get_updated(cls):
+        return "2012-09-07T10:00:00-00:00"
+
+    def get_extended_resources(self, version):
+        if version == "2.0":
+            return EXTENDED_ATTRIBUTES_2_0
+        else:
+            return {}

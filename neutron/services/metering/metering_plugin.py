@@ -12,35 +12,28 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from neutron_lib.api.definitions import metering as metering_apidef
-
 from neutron.api.rpc.agentnotifiers import metering_rpc_agent_api
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.db.metering import metering_db
 from neutron.db.metering import metering_rpc
-from neutron import service
 
 
 class MeteringPlugin(metering_db.MeteringDbMixin):
     """Implementation of the Neutron Metering Service Plugin."""
-    supported_extension_aliases = [metering_apidef.ALIAS]
-    path_prefix = "/metering"
+    supported_extension_aliases = ["metering"]
 
     def __init__(self):
         super(MeteringPlugin, self).__init__()
 
-        self.meter_rpc = metering_rpc_agent_api.MeteringAgentNotifyAPI()
-        rpc_worker = service.RpcWorker([self], worker_process_count=0)
-
-        self.add_worker(rpc_worker)
-
-    def start_rpc_listeners(self):
         self.endpoints = [metering_rpc.MeteringRpcCallbacks(self)]
-        self.conn = n_rpc.create_connection()
+
+        self.conn = n_rpc.create_connection(new=True)
         self.conn.create_consumer(
             topics.METERING_PLUGIN, self.endpoints, fanout=False)
-        return self.conn.consume_in_threads()
+        self.conn.consume_in_threads()
+
+        self.meter_rpc = metering_rpc_agent_api.MeteringAgentNotifyAPI()
 
     def create_metering_label(self, context, metering_label):
         label = super(MeteringPlugin, self).create_metering_label(
@@ -64,8 +57,8 @@ class MeteringPlugin(metering_db.MeteringDbMixin):
         rule = super(MeteringPlugin, self).create_metering_label_rule(
             context, metering_label_rule)
 
-        data = self.get_sync_data_for_rule(context, rule)
-        self.meter_rpc.add_metering_label_rule(context, data)
+        data = self.get_sync_data_metering(context)
+        self.meter_rpc.update_metering_label_rules(context, data)
 
         return rule
 
@@ -73,6 +66,7 @@ class MeteringPlugin(metering_db.MeteringDbMixin):
         rule = super(MeteringPlugin, self).delete_metering_label_rule(
             context, rule_id)
 
-        data = self.get_sync_data_for_rule(context, rule)
-        self.meter_rpc.remove_metering_label_rule(context, data)
+        data = self.get_sync_data_metering(context)
+        self.meter_rpc.update_metering_label_rules(context, data)
+
         return rule

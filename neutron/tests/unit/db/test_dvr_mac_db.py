@@ -14,21 +14,12 @@
 # limitations under the License.
 
 import mock
-from neutron_lib.api.definitions import portbindings
-from neutron_lib.callbacks import events
-from neutron_lib.callbacks import registry
-from neutron_lib.callbacks import resources
-from neutron_lib import constants
-from neutron_lib import context
-from neutron_lib import exceptions as lib_exc
-from neutron_lib.plugins import directory
-from neutron_lib.utils import net
+from oslo_config import cfg
 
+from neutron import context
 from neutron.db import dvr_mac_db
 from neutron.extensions import dvr
-from neutron.objects import router
-from neutron.tests import tools
-from neutron.tests.unit.plugins.ml2 import test_plugin
+from neutron.tests.unit import testlib_api
 
 
 class DVRDbMixinImpl(dvr_mac_db.DVRDbMixin):
@@ -37,7 +28,7 @@ class DVRDbMixinImpl(dvr_mac_db.DVRDbMixin):
         self.notifier = notifier
 
 
-class DvrDbMixinTestCase(test_plugin.Ml2PluginV2TestCase):
+class DvrDbMixinTestCase(testlib_api.SqlTestCase):
 
     def setUp(self):
         super(DvrDbMixinTestCase, self).setUp()
@@ -45,16 +36,18 @@ class DvrDbMixinTestCase(test_plugin.Ml2PluginV2TestCase):
         self.mixin = DVRDbMixinImpl(mock.Mock())
 
     def _create_dvr_mac_entry(self, host, mac_address):
-        router.DVRMacAddress(
-            self.ctx, host=host, mac_address=mac_address).create()
+        with self.ctx.session.begin(subtransactions=True):
+            entry = dvr_mac_db.DistributedVirtualRouterMacAddress(
+                host=host, mac_address=mac_address)
+            self.ctx.session.add(entry)
 
     def test__get_dvr_mac_address_by_host(self):
-        entry = router.DVRMacAddress(
-            self.ctx, host='foo_host',
-            mac_address=tools.get_random_EUI())
-        entry.create()
+        with self.ctx.session.begin(subtransactions=True):
+            entry = dvr_mac_db.DistributedVirtualRouterMacAddress(
+                host='foo_host', mac_address='foo_mac_address')
+            self.ctx.session.add(entry)
         result = self.mixin._get_dvr_mac_address_by_host(self.ctx, 'foo_host')
-        self.assertEqual(entry.to_dict(), result)
+        self.assertEqual(entry, result)
 
     def test__get_dvr_mac_address_by_host_not_found(self):
         self.assertRaises(dvr.DVRMacAddressNotFound,
@@ -62,74 +55,39 @@ class DvrDbMixinTestCase(test_plugin.Ml2PluginV2TestCase):
                           self.ctx, 'foo_host')
 
     def test__create_dvr_mac_address_success(self):
-        entry = {'host': 'foo_host', 'mac_address': tools.get_random_EUI()}
-        with mock.patch.object(net, 'get_random_mac') as f:
+        entry = {'host': 'foo_host', 'mac_address': '00:11:22:33:44:55:66'}
+        with mock.patch.object(dvr_mac_db.utils, 'get_random_mac') as f:
             f.return_value = entry['mac_address']
             expected = self.mixin._create_dvr_mac_address(
                 self.ctx, entry['host'])
         self.assertEqual(expected, entry)
 
     def test__create_dvr_mac_address_retries_exceeded_retry_logic(self):
-        # limit retries so test doesn't take 40 seconds
-        mock.patch('neutron.db.api._retry_db_errors.max_retries',
-                   new=2).start()
-
-        non_unique_mac = tools.get_random_EUI()
-        self._create_dvr_mac_entry('foo_host_1', non_unique_mac)
-        with mock.patch.object(net, 'get_random_mac') as f:
-            f.return_value = non_unique_mac
-            self.assertRaises(lib_exc.HostMacAddressGenerationFailure,
+        new_retries = 8
+        cfg.CONF.set_override('mac_generation_retries', new_retries)
+        self._create_dvr_mac_entry('foo_host_1', 'non_unique_mac')
+        with mock.patch.object(dvr_mac_db.utils, 'get_random_mac') as f:
+            f.return_value = 'non_unique_mac'
+            self.assertRaises(dvr.MacAddressGenerationFailure,
                               self.mixin._create_dvr_mac_address,
                               self.ctx, "foo_host_2")
+        self.assertEqual(new_retries, f.call_count)
 
-    def test_mac_not_cleared_on_agent_delete_event_with_remaining_agents(self):
-        plugin = directory.get_plugin()
-        mac_1 = tools.get_random_EUI()
-        mac_2 = tools.get_random_EUI()
-        self._create_dvr_mac_entry('host_1', mac_1)
-        self._create_dvr_mac_entry('host_2', mac_2)
-        agent1 = {'host': 'host_1', 'id': 'a1'}
-        agent2 = {'host': 'host_1', 'id': 'a2'}
-        with mock.patch.object(plugin, 'get_agents', return_value=[agent2]):
-            with mock.patch.object(plugin, 'notifier') as notifier:
-                registry.notify(resources.AGENT, events.BEFORE_DELETE, self,
-                                context=self.ctx, agent=agent1)
-        mac_list = self.mixin.get_dvr_mac_address_list(self.ctx)
-        for mac in mac_list:
-            self.assertIsInstance(mac, dict)
-        self.assertEqual(2, len(mac_list))
-        self.assertFalse(notifier.dvr_mac_address_update.called)
-
-    def test_mac_cleared_on_agent_delete_event(self):
-        plugin = directory.get_plugin()
-        mac_1 = tools.get_random_EUI()
-        mac_2 = tools.get_random_EUI()
-        self._create_dvr_mac_entry('host_1', mac_1)
-        self._create_dvr_mac_entry('host_2', mac_2)
-        agent = {'host': 'host_1', 'id': 'a1'}
-        with mock.patch.object(plugin, 'notifier') as notifier:
-            registry.notify(resources.AGENT, events.BEFORE_DELETE, self,
-                            context=self.ctx, agent=agent)
-        mac_list = self.mixin.get_dvr_mac_address_list(self.ctx)
-        self.assertEqual(1, len(mac_list))
-        for mac in mac_list:
-            self.assertIsInstance(mac, dict)
-        self.assertEqual('host_2', mac_list[0]['host'])
-        notifier.dvr_mac_address_update.assert_called_once_with(
-            self.ctx, mac_list)
+    def test_delete_dvr_mac_address(self):
+        self._create_dvr_mac_entry('foo_host', 'foo_mac_address')
+        self.mixin.delete_dvr_mac_address(self.ctx, 'foo_host')
+        count = self.ctx.session.query(
+            dvr_mac_db.DistributedVirtualRouterMacAddress).count()
+        self.assertFalse(count)
 
     def test_get_dvr_mac_address_list(self):
-        mac_1 = tools.get_random_EUI()
-        mac_2 = tools.get_random_EUI()
-        self._create_dvr_mac_entry('host_1', mac_1)
-        self._create_dvr_mac_entry('host_2', mac_2)
+        self._create_dvr_mac_entry('host_1', 'mac_1')
+        self._create_dvr_mac_entry('host_2', 'mac_2')
         mac_list = self.mixin.get_dvr_mac_address_list(self.ctx)
         self.assertEqual(2, len(mac_list))
-        for mac in mac_list:
-            self.assertIsInstance(mac, dict)
 
     def test_get_dvr_mac_address_by_host_existing_host(self):
-        self._create_dvr_mac_entry('foo_host', tools.get_random_EUI())
+        self._create_dvr_mac_entry('foo_host', 'foo_mac')
         with mock.patch.object(self.mixin,
                                '_get_dvr_mac_address_by_host') as f:
             self.mixin.get_dvr_mac_address_by_host(self.ctx, 'foo_host')
@@ -139,71 +97,3 @@ class DvrDbMixinTestCase(test_plugin.Ml2PluginV2TestCase):
         with mock.patch.object(self.mixin, '_create_dvr_mac_address') as f:
             self.mixin.get_dvr_mac_address_by_host(self.ctx, 'foo_host')
             self.assertEqual(1, f.call_count)
-
-    def test_get_subnet_for_dvr_returns_correct_mac(self):
-        with self.subnet() as subnet,\
-                self.port(subnet=subnet),\
-                self.port(subnet=subnet):
-            dvr_subnet = self.mixin.get_subnet_for_dvr(self.ctx,
-                                                       subnet['subnet']['id'])
-            # no gateway port should be found so no info should be returned
-            self.assertEqual({}, dvr_subnet)
-            with self.port(
-                    subnet=subnet,
-                    fixed_ips=[{'ip_address': subnet['subnet'][
-                        'gateway_ip']}]) as gw_port:
-                dvr_subnet = self.mixin.get_subnet_for_dvr(
-                    self.ctx, subnet['subnet']['id'])
-                self.assertEqual(gw_port['port']['mac_address'],
-                                 dvr_subnet['gateway_mac'])
-
-    def test_get_subnet_for_dvr_returns_correct_mac_fixed_ips_passed(self):
-        with self.subnet() as subnet,\
-                self.port(subnet=subnet,
-                          fixed_ips=[{'ip_address': '10.0.0.2'}]),\
-                self.port(subnet=subnet,
-                          fixed_ips=[{'ip_address': '10.0.0.3'}]):
-            fixed_ips = [{'subnet_id': subnet['subnet']['id'],
-                          'ip_address': '10.0.0.4'}]
-            dvr_subnet = self.mixin.get_subnet_for_dvr(
-                self.ctx, subnet['subnet']['id'], fixed_ips)
-            # no gateway port should be found so no info should be returned
-            self.assertEqual({}, dvr_subnet)
-            with self.port(
-                    subnet=subnet,
-                    fixed_ips=[{'ip_address': '10.0.0.4'}]) as gw_port:
-                dvr_subnet = self.mixin.get_subnet_for_dvr(
-                    self.ctx, subnet['subnet']['id'], fixed_ips)
-                self.assertEqual(gw_port['port']['mac_address'],
-                                 dvr_subnet['gateway_mac'])
-
-    def test_get_ports_on_host_by_subnet(self):
-        HOST = 'host1'
-        host_arg = {portbindings.HOST_ID: HOST}
-        arg_list = (portbindings.HOST_ID,)
-        with self.subnet() as subnet,\
-                self.port(subnet=subnet,
-                          device_owner=constants.DEVICE_OWNER_COMPUTE_PREFIX,
-                          arg_list=arg_list, **host_arg) as compute_port,\
-                self.port(subnet=subnet,
-                          device_owner=constants.DEVICE_OWNER_DHCP,
-                          arg_list=arg_list, **host_arg) as dhcp_port,\
-                self.port(subnet=subnet,
-                          device_owner=constants.DEVICE_OWNER_LOADBALANCER,
-                          arg_list=arg_list, **host_arg) as lb_port,\
-                self.port(device_owner=constants.DEVICE_OWNER_COMPUTE_PREFIX,
-                          arg_list=arg_list, **host_arg),\
-                self.port(subnet=subnet,
-                          device_owner=constants.DEVICE_OWNER_COMPUTE_PREFIX,
-                          arg_list=arg_list,
-                          **{portbindings.HOST_ID: 'other'}),\
-                self.port(subnet=subnet,
-                          device_owner=constants.DEVICE_OWNER_NETWORK_PREFIX,
-                          arg_list=arg_list, **host_arg):
-            expected_ids = [port['port']['id'] for port in
-                            [compute_port, dhcp_port, lb_port]]
-            dvr_ports = self.mixin.get_ports_on_host_by_subnet(
-                self.ctx, HOST, subnet['subnet']['id'])
-            self.assertEqual(len(expected_ids), len(dvr_ports))
-            self.assertItemsEqual(expected_ids,
-                                  [port['id'] for port in dvr_ports])
